@@ -147,9 +147,9 @@ async fn run_search(
     query: &str,
     limit: usize,
     format: &str,
-    after: Option<String>,
-    project: Option<String>,
-    file: Option<String>,
+    _after: Option<String>,
+    _project: Option<String>,
+    _file: Option<String>,
 ) -> Result<()> {
     let store = store::Store::open()?;
 
