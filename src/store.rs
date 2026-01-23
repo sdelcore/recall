@@ -179,51 +179,52 @@ impl Store {
             FROM fts_chunks
             JOIN chunks c ON c.id = fts_chunks.rowid
             JOIN files f ON f.id = c.file_id
-            WHERE fts_chunks MATCH ?1
+            WHERE fts_chunks MATCH ?
         "#);
 
+        // Build parameter list dynamically
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(query.to_string())];
+
         // Add date filter
-        if options.after.is_some() {
-            sql.push_str(" AND c.date >= ?2");
+        if let Some(after) = &options.after {
+            sql.push_str(" AND c.date >= ?");
+            params_vec.push(Box::new(after.clone()));
         }
 
-        // Add project filter
-        if options.project.is_some() {
-            sql.push_str(" AND c.section LIKE ?3");
+        // Add project filter (search in section name)
+        if let Some(project) = &options.project {
+            sql.push_str(" AND c.section LIKE ?");
+            params_vec.push(Box::new(format!("%{}%", project)));
         }
 
         // Add file pattern filter
-        if options.file_pattern.is_some() {
-            sql.push_str(" AND f.file_path LIKE ?4");
+        if let Some(file_pattern) = &options.file_pattern {
+            sql.push_str(" AND f.file_path LIKE ?");
+            // Convert glob to SQL LIKE pattern
+            let pattern = file_pattern.replace('*', "%").replace('?', "_");
+            params_vec.push(Box::new(pattern));
         }
 
-        sql.push_str(" ORDER BY score LIMIT ?5");
+        sql.push_str(" ORDER BY score LIMIT ?");
+        params_vec.push(Box::new(limit as i64));
 
         let mut stmt = self.conn.prepare(&sql)?;
 
-        // Bind parameters dynamically
-        let after_val = options.after.clone().unwrap_or_default();
-        let project_val = options.project.as_ref().map(|p| format!("%{}%", p)).unwrap_or_default();
-        let file_val = options.file_pattern.as_ref().map(|f| {
-            // Convert glob to SQL LIKE pattern
-            f.replace('*', "%").replace('?', "_")
-        }).unwrap_or_default();
+        // Convert params to references for rusqlite
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
 
-        let results = stmt.query_map(
-            params![query, after_val, project_val, file_val, limit as i64],
-            |row| {
-                Ok(SearchResult {
-                    file_path: row.get(0)?,
-                    start_line: row.get(1)?,
-                    end_line: row.get(2)?,
-                    content: row.get(3)?,
-                    score: row.get::<_, f64>(4)?.abs(), // BM25 returns negative scores
-                    date: row.get(5)?,
-                    section: row.get(6)?,
-                    project: row.get(7)?,
-                })
-            },
-        )?;
+        let results = stmt.query_map(params_refs.as_slice(), |row| {
+            Ok(SearchResult {
+                file_path: row.get(0)?,
+                start_line: row.get(1)?,
+                end_line: row.get(2)?,
+                content: row.get(3)?,
+                score: row.get::<_, f64>(4)?.abs(), // BM25 returns negative scores
+                date: row.get(5)?,
+                section: row.get(6)?,
+                project: row.get(7)?,
+            })
+        })?;
 
         let mut search_results = Vec::new();
         for result in results {
