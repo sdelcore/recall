@@ -128,6 +128,14 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);
             CREATE INDEX IF NOT EXISTS idx_chunks_date ON chunks(date);
             CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime);
+
+            -- Embeddings storage (stored as JSON array for simplicity)
+            -- Note: For production, consider sqlite-vec extension for better performance
+            CREATE TABLE IF NOT EXISTS embeddings (
+                chunk_id INTEGER PRIMARY KEY,
+                embedding BLOB NOT NULL,
+                FOREIGN KEY (chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+            );
         "#).context("Failed to initialize schema")?;
 
         Ok(())
@@ -232,6 +240,220 @@ impl Store {
         }
 
         Ok(search_results)
+    }
+
+    /// Store embedding for a chunk
+    pub fn store_embedding(&self, chunk_id: i64, embedding: &[f32]) -> Result<()> {
+        // Serialize embedding as bytes (4 bytes per f32)
+        let bytes: Vec<u8> = embedding
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+
+        self.conn.execute(
+            "INSERT OR REPLACE INTO embeddings (chunk_id, embedding) VALUES (?1, ?2)",
+            params![chunk_id, bytes],
+        )?;
+
+        Ok(())
+    }
+
+    /// Get embedding for a chunk
+    #[allow(dead_code)]
+    pub fn get_embedding(&self, chunk_id: i64) -> Result<Option<Vec<f32>>> {
+        let result: Result<Vec<u8>, _> = self.conn.query_row(
+            "SELECT embedding FROM embeddings WHERE chunk_id = ?1",
+            params![chunk_id],
+            |row| row.get(0),
+        );
+
+        match result {
+            Ok(bytes) => {
+                // Deserialize bytes to f32 array
+                let embedding: Vec<f32> = bytes
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                    .collect();
+                Ok(Some(embedding))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Get all chunk IDs that don't have embeddings
+    pub fn get_chunks_without_embeddings(&self) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            r#"SELECT c.id, c.content
+               FROM chunks c
+               LEFT JOIN embeddings e ON c.id = e.chunk_id
+               WHERE e.chunk_id IS NULL"#,
+        )?;
+
+        let results = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let mut chunks = Vec::new();
+        for result in results {
+            chunks.push(result?);
+        }
+
+        Ok(chunks)
+    }
+
+    /// Get embedding statistics
+    pub fn get_embedding_stats(&self) -> Result<(i64, i64)> {
+        let total_chunks: i64 = self.conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
+            .unwrap_or(0);
+
+        let embedded_chunks: i64 = self.conn
+            .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
+            .unwrap_or(0);
+
+        Ok((embedded_chunks, total_chunks))
+    }
+
+    /// Vector search using cosine similarity
+    pub fn search_vector(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(i64, f64)>> {
+        // Get all embeddings and compute similarity
+        let mut stmt = self.conn.prepare(
+            "SELECT chunk_id, embedding FROM embeddings"
+        )?;
+
+        let results = stmt.query_map([], |row| {
+            let chunk_id: i64 = row.get(0)?;
+            let bytes: Vec<u8> = row.get(1)?;
+            Ok((chunk_id, bytes))
+        })?;
+
+        let mut scored: Vec<(i64, f64)> = Vec::new();
+
+        for result in results {
+            let (chunk_id, bytes) = result?;
+
+            // Deserialize embedding
+            let embedding: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect();
+
+            // Compute cosine similarity
+            let similarity = crate::embedder::cosine_similarity(query_embedding, &embedding);
+            scored.push((chunk_id, similarity as f64));
+        }
+
+        // Sort by similarity (descending) and take top N
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+
+        Ok(scored)
+    }
+
+    /// Hybrid search combining BM25 and vector search
+    pub fn search_hybrid(
+        &self,
+        query: &str,
+        query_embedding: &[f32],
+        limit: usize,
+        vector_weight: f64,
+        bm25_weight: f64,
+    ) -> Result<Vec<SearchResult>> {
+        // Get more candidates than needed for merging
+        let candidate_count = limit * 3;
+
+        // BM25 search
+        let bm25_results = self.search_fts_filtered(query, candidate_count, &SearchOptions::default())?;
+
+        // Vector search
+        let vector_results = self.search_vector(query_embedding, candidate_count)?;
+
+        // Normalize scores and merge
+        let mut combined_scores: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
+
+        // Normalize and add BM25 scores
+        if !bm25_results.is_empty() {
+            let max_bm25 = bm25_results.iter().map(|r| r.score).fold(0.0_f64, f64::max);
+            if max_bm25 > 0.0 {
+                for result in bm25_results.iter() {
+                    // Get chunk ID from position (we need to look it up)
+                    if let Ok(chunk_id) = self.get_chunk_id_by_content(&result.content) {
+                        let normalized = result.score / max_bm25;
+                        *combined_scores.entry(chunk_id).or_insert(0.0) += normalized * bm25_weight;
+                    }
+                }
+            }
+        }
+
+        // Normalize and add vector scores
+        if !vector_results.is_empty() {
+            let max_vector = vector_results.iter().map(|(_, s)| *s).fold(0.0_f64, f64::max);
+            if max_vector > 0.0 {
+                for (chunk_id, score) in &vector_results {
+                    let normalized = score / max_vector;
+                    *combined_scores.entry(*chunk_id).or_insert(0.0) += normalized * vector_weight;
+                }
+            }
+        }
+
+        // Sort by combined score
+        let mut ranked: Vec<(i64, f64)> = combined_scores.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(limit);
+
+        // Fetch full results
+        let mut results = Vec::new();
+        for (chunk_id, score) in ranked {
+            if let Ok(Some(result)) = self.get_chunk_by_id(chunk_id, score) {
+                results.push(result);
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Get chunk ID by content (helper for hybrid search)
+    fn get_chunk_id_by_content(&self, content: &str) -> Result<i64> {
+        let chunk_id: i64 = self.conn.query_row(
+            "SELECT id FROM chunks WHERE content = ?1 LIMIT 1",
+            params![content],
+            |row| row.get(0),
+        )?;
+        Ok(chunk_id)
+    }
+
+    /// Get chunk by ID with score
+    fn get_chunk_by_id(&self, chunk_id: i64, score: f64) -> Result<Option<SearchResult>> {
+        let result = self.conn.query_row(
+            r#"SELECT f.file_path, c.start_line, c.end_line, c.content, c.date, c.section, c.project
+               FROM chunks c
+               JOIN files f ON f.id = c.file_id
+               WHERE c.id = ?1"#,
+            params![chunk_id],
+            |row| {
+                Ok(SearchResult {
+                    file_path: row.get(0)?,
+                    start_line: row.get(1)?,
+                    end_line: row.get(2)?,
+                    content: row.get(3)?,
+                    score,
+                    date: row.get(4)?,
+                    section: row.get(5)?,
+                    project: row.get(6)?,
+                })
+            },
+        );
+
+        match result {
+            Ok(r) => Ok(Some(r)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Index a single file

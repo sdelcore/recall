@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod embedder;
 mod store;
 mod watcher;
 
@@ -43,6 +44,25 @@ enum Commands {
         /// Filter by file pattern (glob)
         #[arg(long)]
         file: Option<String>,
+
+        /// Use hybrid search (BM25 + vector)
+        #[arg(long)]
+        hybrid: bool,
+
+        /// Vector weight for hybrid search (0.0-1.0)
+        #[arg(long, default_value = "0.7")]
+        vector_weight: f64,
+    },
+
+    /// Generate embeddings for indexed chunks
+    Embed {
+        /// Only embed chunks that don't have embeddings
+        #[arg(long)]
+        incremental: bool,
+
+        /// Maximum chunks to embed (for testing)
+        #[arg(long)]
+        limit: Option<usize>,
     },
 
     /// Index files into the memory database
@@ -105,7 +125,7 @@ async fn main() -> Result<()> {
     // Handle direct query (no subcommand)
     if !cli.query.is_empty() {
         let query = cli.query.join(" ");
-        return run_search(&query, 5, "compact", None, None, None).await;
+        return run_search(&query, 5, "compact", None, None, None, false, 0.7).await;
     }
 
     match cli.command {
@@ -116,8 +136,10 @@ async fn main() -> Result<()> {
             after,
             project,
             file,
+            hybrid,
+            vector_weight,
         }) => {
-            run_search(&query, limit, &format, after, project, file).await
+            run_search(&query, limit, &format, after, project, file, hybrid, vector_weight).await
         }
         Some(Commands::Index {
             path,
@@ -125,6 +147,9 @@ async fn main() -> Result<()> {
             file,
         }) => {
             run_index(path, incremental, file).await
+        }
+        Some(Commands::Embed { incremental, limit }) => {
+            run_embed(incremental, limit).await
         }
         Some(Commands::Status { json }) => {
             run_status(json).await
@@ -151,6 +176,8 @@ async fn run_search(
     after: Option<String>,
     project: Option<String>,
     file: Option<String>,
+    hybrid: bool,
+    vector_weight: f64,
 ) -> Result<()> {
     let store = store::Store::open()?;
 
@@ -161,8 +188,27 @@ async fn run_search(
         file_pattern: file,
     };
 
-    // FTS5 search with filters (vector search comes later)
-    let results = store.search_fts_filtered(query, limit, &options)?;
+    let results = if hybrid {
+        // Hybrid search with embeddings
+        let embedder = embedder::Embedder::new();
+
+        // Check if embeddings are available
+        let (embedded, _) = store.get_embedding_stats()?;
+        if embedded == 0 {
+            eprintln!("Warning: No embeddings found. Run 'memory-search embed' first.");
+            eprintln!("Falling back to BM25 search.\n");
+            store.search_fts_filtered(query, limit, &options)?
+        } else {
+            // Generate query embedding
+            let query_embedding = embedder.embed(query).await?;
+            let bm25_weight = 1.0 - vector_weight;
+
+            store.search_hybrid(query, &query_embedding, limit, vector_weight, bm25_weight)?
+        }
+    } else {
+        // BM25 only
+        store.search_fts_filtered(query, limit, &options)?
+    };
 
     match format {
         "json" => {
@@ -246,11 +292,13 @@ async fn run_index(path: Option<String>, incremental: bool, file: Option<String>
 async fn run_status(json: bool) -> Result<()> {
     let store = store::Store::open()?;
     let stats = store.get_stats()?;
+    let (embedded, _) = store.get_embedding_stats()?;
 
     if json {
         let output = serde_json::json!({
             "file_count": stats.file_count,
             "chunk_count": stats.chunk_count,
+            "embedded_count": embedded,
             "last_indexed": stats.last_indexed,
             "database_path": store.path(),
         });
@@ -261,6 +309,10 @@ async fn run_status(json: bool) -> Result<()> {
         println!("Database: {}", store.path());
         println!("Files indexed: {}", stats.file_count);
         println!("Chunks stored: {}", stats.chunk_count);
+        println!("Embeddings: {}/{} ({:.1}%)",
+            embedded, stats.chunk_count,
+            if stats.chunk_count > 0 { (embedded as f64 / stats.chunk_count as f64) * 100.0 } else { 0.0 }
+        );
         if let Some(last) = stats.last_indexed {
             println!("Last indexed: {}", last);
         }
@@ -280,6 +332,77 @@ async fn run_watch(path: Option<String>, debounce: u64) -> Result<()> {
     println!("Press Ctrl+C to stop\n");
 
     watcher::watch_directory(&watch_path, debounce)
+}
+
+async fn run_embed(incremental: bool, limit: Option<usize>) -> Result<()> {
+    let store = store::Store::open()?;
+    let embedder = embedder::Embedder::new();
+
+    // Check Ollama connectivity
+    println!("Checking Ollama connectivity...");
+    if !embedder.health_check().await? {
+        anyhow::bail!("Cannot connect to Ollama at http://nightman.tap:11434. Is it running?");
+    }
+    println!("Ollama is available.");
+
+    // Get chunks that need embeddings
+    let chunks = if incremental {
+        store.get_chunks_without_embeddings()?
+    } else {
+        // For non-incremental, we'd need to get all chunks
+        // For now, just do incremental (only missing)
+        store.get_chunks_without_embeddings()?
+    };
+
+    let total = match limit {
+        Some(l) => chunks.len().min(l),
+        None => chunks.len(),
+    };
+
+    if total == 0 {
+        println!("All chunks already have embeddings.");
+        return Ok(());
+    }
+
+    println!("Generating embeddings for {} chunks...\n", total);
+
+    let mut success_count = 0;
+    let mut error_count = 0;
+
+    for (i, (chunk_id, content)) in chunks.iter().take(total).enumerate() {
+        // Progress indicator
+        print!("\r[{}/{}] Embedding chunk {}...", i + 1, total, chunk_id);
+        std::io::Write::flush(&mut std::io::stdout())?;
+
+        match embedder.embed(content).await {
+            Ok(embedding) => {
+                if let Err(e) = store.store_embedding(*chunk_id, &embedding) {
+                    eprintln!("\nFailed to store embedding for chunk {}: {}", chunk_id, e);
+                    error_count += 1;
+                } else {
+                    success_count += 1;
+                }
+            }
+            Err(e) => {
+                eprintln!("\nFailed to generate embedding for chunk {}: {}", chunk_id, e);
+                error_count += 1;
+            }
+        }
+    }
+
+    println!("\n\nEmbedding complete:");
+    println!("  Success: {}", success_count);
+    if error_count > 0 {
+        println!("  Errors: {}", error_count);
+    }
+
+    let (embedded, total_chunks) = store.get_embedding_stats()?;
+    println!("  Total embedded: {}/{} chunks ({:.1}%)",
+        embedded, total_chunks,
+        (embedded as f64 / total_chunks as f64) * 100.0
+    );
+
+    Ok(())
 }
 
 async fn run_config(action: ConfigAction) -> Result<()> {
