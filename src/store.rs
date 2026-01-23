@@ -25,6 +25,14 @@ pub struct StoreStats {
     pub last_indexed: Option<String>,
 }
 
+/// Search options for filtering
+#[derive(Default)]
+pub struct SearchOptions {
+    pub after: Option<String>,
+    pub project: Option<String>,
+    pub file_pattern: Option<String>,
+}
+
 /// SQLite-based memory store
 pub struct Store {
     conn: Connection,
@@ -150,9 +158,15 @@ impl Store {
         })
     }
 
-    /// Search using FTS5 (BM25)
-    pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-        let mut stmt = self.conn.prepare(r#"
+    /// Search using FTS5 (BM25) with filters
+    pub fn search_fts_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        options: &SearchOptions,
+    ) -> Result<Vec<SearchResult>> {
+        // Build dynamic query with filters
+        let mut sql = String::from(r#"
             SELECT
                 f.file_path,
                 c.start_line,
@@ -166,22 +180,50 @@ impl Store {
             JOIN chunks c ON c.id = fts_chunks.rowid
             JOIN files f ON f.id = c.file_id
             WHERE fts_chunks MATCH ?1
-            ORDER BY score
-            LIMIT ?2
-        "#)?;
+        "#);
 
-        let results = stmt.query_map(params![query, limit as i64], |row| {
-            Ok(SearchResult {
-                file_path: row.get(0)?,
-                start_line: row.get(1)?,
-                end_line: row.get(2)?,
-                content: row.get(3)?,
-                score: row.get::<_, f64>(4)?.abs(), // BM25 returns negative scores
-                date: row.get(5)?,
-                section: row.get(6)?,
-                project: row.get(7)?,
-            })
-        })?;
+        // Add date filter
+        if options.after.is_some() {
+            sql.push_str(" AND c.date >= ?2");
+        }
+
+        // Add project filter
+        if options.project.is_some() {
+            sql.push_str(" AND c.section LIKE ?3");
+        }
+
+        // Add file pattern filter
+        if options.file_pattern.is_some() {
+            sql.push_str(" AND f.file_path LIKE ?4");
+        }
+
+        sql.push_str(" ORDER BY score LIMIT ?5");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+
+        // Bind parameters dynamically
+        let after_val = options.after.clone().unwrap_or_default();
+        let project_val = options.project.as_ref().map(|p| format!("%{}%", p)).unwrap_or_default();
+        let file_val = options.file_pattern.as_ref().map(|f| {
+            // Convert glob to SQL LIKE pattern
+            f.replace('*', "%").replace('?', "_")
+        }).unwrap_or_default();
+
+        let results = stmt.query_map(
+            params![query, after_val, project_val, file_val, limit as i64],
+            |row| {
+                Ok(SearchResult {
+                    file_path: row.get(0)?,
+                    start_line: row.get(1)?,
+                    end_line: row.get(2)?,
+                    content: row.get(3)?,
+                    score: row.get::<_, f64>(4)?.abs(), // BM25 returns negative scores
+                    date: row.get(5)?,
+                    section: row.get(6)?,
+                    project: row.get(7)?,
+                })
+            },
+        )?;
 
         let mut search_results = Vec::new();
         for result in results {

@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod store;
+mod watcher;
 
 #[derive(Parser)]
 #[command(name = "memory-search")]
@@ -147,14 +148,21 @@ async fn run_search(
     query: &str,
     limit: usize,
     format: &str,
-    _after: Option<String>,
-    _project: Option<String>,
-    _file: Option<String>,
+    after: Option<String>,
+    project: Option<String>,
+    file: Option<String>,
 ) -> Result<()> {
     let store = store::Store::open()?;
 
-    // For now, just do FTS5 search (vector search comes later)
-    let results = store.search_fts(query, limit)?;
+    // Build search options from filters
+    let options = store::SearchOptions {
+        after,
+        project,
+        file_pattern: file,
+    };
+
+    // FTS5 search with filters (vector search comes later)
+    let results = store.search_fts_filtered(query, limit, &options)?;
 
     match format {
         "json" => {
@@ -269,12 +277,9 @@ async fn run_watch(path: Option<String>, debounce: u64) -> Result<()> {
     });
 
     println!("Watching {} for changes (debounce: {}ms)", watch_path, debounce);
-    println!("Press Ctrl+C to stop");
+    println!("Press Ctrl+C to stop\n");
 
-    // TODO: Implement file watching
-    println!("File watching not yet implemented");
-
-    Ok(())
+    watcher::watch_directory(&watch_path, debounce)
 }
 
 async fn run_config(action: ConfigAction) -> Result<()> {
