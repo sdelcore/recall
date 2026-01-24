@@ -5,20 +5,28 @@ use std::path::Path;
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
+use crate::config::Config;
 use crate::store::Store;
 
-/// Watch a directory for changes and auto-index modified files
-pub fn watch_directory(path: &str, debounce_ms: u64) -> Result<()> {
+/// Watch directories for changes and auto-index modified files
+pub fn watch_directories(config: &Config) -> Result<()> {
     let (tx, rx) = channel();
 
-    let debounce_duration = Duration::from_millis(debounce_ms);
+    let debounce_duration = Duration::from_millis(config.watch.debounce_ms);
     let mut debouncer = new_debouncer(debounce_duration, tx)?;
 
-    debouncer
-        .watcher()
-        .watch(Path::new(path), RecursiveMode::Recursive)?;
+    let watch_paths = config.watch_paths();
 
-    println!("Watching {} for changes...", path);
+    for path in &watch_paths {
+        println!("Watching: {}", path);
+        debouncer
+            .watcher()
+            .watch(Path::new(path), RecursiveMode::Recursive)?;
+    }
+
+    println!("Excluding patterns: {:?}", config.watch.exclude);
+    println!("Debounce: {}ms", config.watch.debounce_ms);
+    println!();
 
     let store = Store::open()?;
 
@@ -35,7 +43,7 @@ pub fn watch_directory(path: &str, debounce_ms: u64) -> Result<()> {
                         }
 
                         // Skip excluded patterns
-                        if should_skip(&path_str) {
+                        if config.should_skip_watch(&path_str) {
                             continue;
                         }
 
@@ -56,15 +64,4 @@ pub fn watch_directory(path: &str, debounce_ms: u64) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn should_skip(path: &str) -> bool {
-    let exclude_patterns = [
-        "Templates/",
-        ".obsidian/",
-        "attachments/",
-        ".sync-conflict-",
-    ];
-
-    exclude_patterns.iter().any(|pattern| path.contains(pattern))
 }

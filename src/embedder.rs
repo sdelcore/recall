@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::config::Config;
+
 /// Ollama embedding client
 pub struct Embedder {
     client: reqwest::Client,
@@ -22,11 +24,16 @@ struct EmbeddingResponse {
 impl Embedder {
     /// Create a new embedder with default settings
     pub fn new() -> Self {
-        Self::with_config("http://nightman.tap:11434", "nomic-embed-text")
+        Self::with_url_and_model("http://nightman.tap:11434", "nomic-embed-text")
     }
 
-    /// Create embedder with custom config
-    pub fn with_config(base_url: &str, model: &str) -> Self {
+    /// Create embedder from Config
+    pub fn new_with_config(config: &Config) -> Self {
+        Self::with_url_and_model(&config.embeddings.ollama_url, &config.embeddings.model)
+    }
+
+    /// Create embedder with custom URL and model
+    pub fn with_url_and_model(base_url: &str, model: &str) -> Self {
         Self {
             client: reqwest::Client::new(),
             base_url: base_url.to_string(),

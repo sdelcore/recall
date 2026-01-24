@@ -1,9 +1,12 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod config;
 mod embedder;
 mod store;
 mod watcher;
+
+use config::Config;
 
 #[derive(Parser)]
 #[command(name = "memory-search")]
@@ -26,8 +29,8 @@ enum Commands {
         query: String,
 
         /// Maximum number of results
-        #[arg(short, long, default_value = "5")]
-        limit: usize,
+        #[arg(short, long)]
+        limit: Option<usize>,
 
         /// Output format: compact, json, full
         #[arg(short, long, default_value = "compact")]
@@ -50,8 +53,8 @@ enum Commands {
         hybrid: bool,
 
         /// Vector weight for hybrid search (0.0-1.0)
-        #[arg(long, default_value = "0.7")]
-        vector_weight: f64,
+        #[arg(long)]
+        vector_weight: Option<f64>,
     },
 
     /// Generate embeddings for indexed chunks
@@ -67,7 +70,7 @@ enum Commands {
 
     /// Index files into the memory database
     Index {
-        /// Path to index (defaults to ~/Obsidian)
+        /// Path to index (defaults to config paths)
         #[arg(short, long)]
         path: Option<String>,
 
@@ -88,15 +91,7 @@ enum Commands {
     },
 
     /// Watch for file changes and auto-index
-    Watch {
-        /// Path to watch (defaults to ~/Obsidian)
-        #[arg(short, long)]
-        path: Option<String>,
-
-        /// Debounce time in milliseconds
-        #[arg(long, default_value = "1500")]
-        debounce: u64,
-    },
+    Watch,
 
     /// Manage configuration
     Config {
@@ -109,23 +104,19 @@ enum Commands {
 enum ConfigAction {
     /// Show current configuration
     Show,
-    /// Set a configuration value
-    Set {
-        /// Configuration key
-        key: String,
-        /// Configuration value
-        value: String,
-    },
+    /// Show config file path
+    Path,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let config = Config::load()?;
 
     // Handle direct query (no subcommand)
     if !cli.query.is_empty() {
         let query = cli.query.join(" ");
-        return run_search(&query, 5, "compact", None, None, None, false, 0.7).await;
+        return run_search(&config, &query, None, "compact", None, None, None, false, None).await;
     }
 
     match cli.command {
@@ -139,26 +130,26 @@ async fn main() -> Result<()> {
             hybrid,
             vector_weight,
         }) => {
-            run_search(&query, limit, &format, after, project, file, hybrid, vector_weight).await
+            run_search(&config, &query, limit, &format, after, project, file, hybrid, vector_weight).await
         }
         Some(Commands::Index {
             path,
             incremental,
             file,
         }) => {
-            run_index(path, incremental, file).await
+            run_index(&config, path, incremental, file).await
         }
         Some(Commands::Embed { incremental, limit }) => {
-            run_embed(incremental, limit).await
+            run_embed(&config, incremental, limit).await
         }
         Some(Commands::Status { json }) => {
             run_status(json).await
         }
-        Some(Commands::Watch { path, debounce }) => {
-            run_watch(path, debounce).await
+        Some(Commands::Watch) => {
+            run_watch(&config)
         }
         Some(Commands::Config { action }) => {
-            run_config(action).await
+            run_config(&config, action)
         }
         None => {
             // No command and no query - show help
@@ -170,16 +161,19 @@ async fn main() -> Result<()> {
 }
 
 async fn run_search(
+    config: &Config,
     query: &str,
-    limit: usize,
+    limit: Option<usize>,
     format: &str,
     after: Option<String>,
     project: Option<String>,
     file: Option<String>,
     hybrid: bool,
-    vector_weight: f64,
+    vector_weight: Option<f64>,
 ) -> Result<()> {
     let store = store::Store::open()?;
+    let limit = limit.unwrap_or(config.search.default_limit);
+    let vector_weight = vector_weight.unwrap_or(config.search.vector_weight);
 
     // Build search options from filters
     let options = store::SearchOptions {
@@ -190,7 +184,7 @@ async fn run_search(
 
     let results = if hybrid {
         // Hybrid search with embeddings
-        let embedder = embedder::Embedder::new();
+        let embedder = embedder::Embedder::new_with_config(config);
 
         // Check if embeddings are available
         let (embedded, _) = store.get_embedding_stats()?;
@@ -259,7 +253,7 @@ async fn run_search(
     Ok(())
 }
 
-async fn run_index(path: Option<String>, incremental: bool, file: Option<String>) -> Result<()> {
+async fn run_index(config: &Config, path: Option<String>, incremental: bool, file: Option<String>) -> Result<()> {
     let store = store::Store::open()?;
 
     if let Some(file_path) = file {
@@ -269,18 +263,20 @@ async fn run_index(path: Option<String>, incremental: bool, file: Option<String>
         return Ok(());
     }
 
-    let index_path = path.unwrap_or_else(|| {
-        dirs::home_dir()
-            .map(|h| h.join("Obsidian").to_string_lossy().to_string())
-            .unwrap_or_else(|| "~/Obsidian".to_string())
-    });
-
-    if incremental {
-        println!("Incremental indexing: {}", index_path);
-        store.index_incremental(&index_path)?;
+    let index_paths = if let Some(p) = path {
+        vec![config::expand_home(&p)]
     } else {
-        println!("Full indexing: {}", index_path);
-        store.index_full(&index_path)?;
+        config.index_paths()
+    };
+
+    for index_path in &index_paths {
+        if incremental {
+            println!("Incremental indexing: {}", index_path);
+            store.index_incremental(index_path)?;
+        } else {
+            println!("Full indexing: {}", index_path);
+            store.index_full(index_path)?;
+        }
     }
 
     let stats = store.get_stats()?;
@@ -291,6 +287,7 @@ async fn run_index(path: Option<String>, incremental: bool, file: Option<String>
 
 async fn run_status(json: bool) -> Result<()> {
     let store = store::Store::open()?;
+    let config = Config::load()?;
     let stats = store.get_stats()?;
     let (embedded, _) = store.get_embedding_stats()?;
 
@@ -301,12 +298,20 @@ async fn run_status(json: bool) -> Result<()> {
             "embedded_count": embedded,
             "last_indexed": stats.last_indexed,
             "database_path": store.path(),
+            "config_path": Config::config_path(),
+            "watch_paths": config.watch_paths(),
+            "index_paths": config.index_paths(),
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         println!("Memory Search Status");
         println!("====================");
         println!("Database: {}", store.path());
+        println!("Config: {}", Config::config_path().display());
+        println!();
+        println!("Index paths: {:?}", config.index_paths());
+        println!("Watch paths: {:?}", config.watch_paths());
+        println!();
         println!("Files indexed: {}", stats.file_count);
         println!("Chunks stored: {}", stats.chunk_count);
         println!("Embeddings: {}/{} ({:.1}%)",
@@ -321,27 +326,51 @@ async fn run_status(json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn run_watch(path: Option<String>, debounce: u64) -> Result<()> {
-    let watch_path = path.unwrap_or_else(|| {
-        dirs::home_dir()
-            .map(|h| h.join("Obsidian").to_string_lossy().to_string())
-            .unwrap_or_else(|| "~/Obsidian".to_string())
-    });
-
-    println!("Watching {} for changes (debounce: {}ms)", watch_path, debounce);
-    println!("Press Ctrl+C to stop\n");
-
-    watcher::watch_directory(&watch_path, debounce)
+fn run_watch(config: &Config) -> Result<()> {
+    println!("Memory Search File Watcher");
+    println!("==========================");
+    watcher::watch_directories(config)
 }
 
-async fn run_embed(incremental: bool, limit: Option<usize>) -> Result<()> {
+fn run_config(config: &Config, action: ConfigAction) -> Result<()> {
+    match action {
+        ConfigAction::Show => {
+            println!("Configuration (from {:?}):", Config::config_path());
+            println!();
+            println!("[index]");
+            println!("paths = {:?}", config.index.paths);
+            println!("exclude = {:?}", config.index.exclude);
+            println!();
+            println!("[embeddings]");
+            println!("ollama_url = \"{}\"", config.embeddings.ollama_url);
+            println!("model = \"{}\"", config.embeddings.model);
+            println!();
+            println!("[search]");
+            println!("default_limit = {}", config.search.default_limit);
+            println!("vector_weight = {}", config.search.vector_weight);
+            println!("bm25_weight = {}", config.search.bm25_weight);
+            println!();
+            println!("[watch]");
+            println!("paths = {:?}", config.watch.paths);
+            println!("exclude = {:?}", config.watch.exclude);
+            println!("debounce_ms = {}", config.watch.debounce_ms);
+        }
+        ConfigAction::Path => {
+            println!("{}", Config::config_path().display());
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_embed(config: &Config, incremental: bool, limit: Option<usize>) -> Result<()> {
     let store = store::Store::open()?;
-    let embedder = embedder::Embedder::new();
+    let embedder = embedder::Embedder::new_with_config(config);
 
     // Check Ollama connectivity
-    println!("Checking Ollama connectivity...");
+    println!("Checking Ollama connectivity at {}...", config.embeddings.ollama_url);
     if !embedder.health_check().await? {
-        anyhow::bail!("Cannot connect to Ollama at http://nightman.tap:11434. Is it running?");
+        anyhow::bail!("Cannot connect to Ollama at {}. Is it running?", config.embeddings.ollama_url);
     }
     println!("Ollama is available.");
 
@@ -364,7 +393,7 @@ async fn run_embed(incremental: bool, limit: Option<usize>) -> Result<()> {
         return Ok(());
     }
 
-    println!("Generating embeddings for {} chunks...\n", total);
+    println!("Generating embeddings for {} chunks using {}...\n", total, config.embeddings.model);
 
     let mut success_count = 0;
     let mut error_count = 0;
@@ -401,27 +430,6 @@ async fn run_embed(incremental: bool, limit: Option<usize>) -> Result<()> {
         embedded, total_chunks,
         (embedded as f64 / total_chunks as f64) * 100.0
     );
-
-    Ok(())
-}
-
-async fn run_config(action: ConfigAction) -> Result<()> {
-    match action {
-        ConfigAction::Show => {
-            println!("Configuration:");
-            println!("  index.paths: [\"~/Obsidian/\"]");
-            println!("  embeddings.ollama_url: http://nightman.tap:11434");
-            println!("  embeddings.model: nomic-embed-text");
-            println!("  search.default_limit: 5");
-            println!("  search.vector_weight: 0.7");
-            println!("  search.bm25_weight: 0.3");
-            println!("\nConfig file: ~/.config/memory-search/config.toml");
-        }
-        ConfigAction::Set { key, value } => {
-            println!("Setting {} = {}", key, value);
-            println!("Configuration management not yet implemented");
-        }
-    }
 
     Ok(())
 }
