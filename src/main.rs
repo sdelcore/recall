@@ -9,14 +9,14 @@ mod watcher;
 use config::Config;
 
 #[derive(Parser)]
-#[command(name = "memory-search")]
+#[command(name = "recall")]
 #[command(about = "Semantic memory search with token-efficient retrieval")]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Search query (shorthand for `memory-search search <query>`)
+    /// Search query (shorthand for `recall search <query>`)
     #[arg(trailing_var_arg = true)]
     query: Vec<String>,
 }
@@ -51,10 +51,6 @@ enum Commands {
         /// Use hybrid search (BM25 + vector)
         #[arg(long)]
         hybrid: bool,
-
-        /// Vector weight for hybrid search (0.0-1.0)
-        #[arg(long)]
-        vector_weight: Option<f64>,
     },
 
     /// Generate embeddings for indexed chunks
@@ -116,7 +112,7 @@ async fn main() -> Result<()> {
     // Handle direct query (no subcommand)
     if !cli.query.is_empty() {
         let query = cli.query.join(" ");
-        return run_search(&config, &query, None, "compact", None, None, None, false, None).await;
+        return run_search(&config, &query, None, "compact", None, None, None, false).await;
     }
 
     match cli.command {
@@ -128,9 +124,8 @@ async fn main() -> Result<()> {
             project,
             file,
             hybrid,
-            vector_weight,
         }) => {
-            run_search(&config, &query, limit, &format, after, project, file, hybrid, vector_weight).await
+            run_search(&config, &query, limit, &format, after, project, file, hybrid).await
         }
         Some(Commands::Index {
             path,
@@ -169,11 +164,9 @@ async fn run_search(
     project: Option<String>,
     file: Option<String>,
     hybrid: bool,
-    vector_weight: Option<f64>,
 ) -> Result<()> {
     let store = store::Store::open()?;
     let limit = limit.unwrap_or(config.search.default_limit);
-    let vector_weight = vector_weight.unwrap_or(config.search.vector_weight);
 
     // Build search options from filters
     let options = store::SearchOptions {
@@ -189,15 +182,14 @@ async fn run_search(
         // Check if embeddings are available
         let (embedded, _) = store.get_embedding_stats()?;
         if embedded == 0 {
-            eprintln!("Warning: No embeddings found. Run 'memory-search embed' first.");
+            eprintln!("Warning: No embeddings found. Run 'recall embed' first.");
             eprintln!("Falling back to BM25 search.\n");
             store.search_fts_filtered(query, limit, &options)?
         } else {
             // Generate query embedding
             let query_embedding = embedder.embed(query).await?;
-            let bm25_weight = 1.0 - vector_weight;
 
-            store.search_hybrid(query, &query_embedding, limit, vector_weight, bm25_weight)?
+            store.search_hybrid(query, &query_embedding, limit, config.search.rrf_k)?
         }
     } else {
         // BM25 only
@@ -304,8 +296,8 @@ async fn run_status(json: bool) -> Result<()> {
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
-        println!("Memory Search Status");
-        println!("====================");
+        println!("Recall Status");
+        println!("=============");
         println!("Database: {}", store.path());
         println!("Config: {}", Config::config_path().display());
         println!();
@@ -327,8 +319,8 @@ async fn run_status(json: bool) -> Result<()> {
 }
 
 fn run_watch(config: &Config) -> Result<()> {
-    println!("Memory Search File Watcher");
-    println!("==========================");
+    println!("Recall File Watcher");
+    println!("===================");
     watcher::watch_directories(config)
 }
 
@@ -347,8 +339,7 @@ fn run_config(config: &Config, action: ConfigAction) -> Result<()> {
             println!();
             println!("[search]");
             println!("default_limit = {}", config.search.default_limit);
-            println!("vector_weight = {}", config.search.vector_weight);
-            println!("bm25_weight = {}", config.search.bm25_weight);
+            println!("rrf_k = {}", config.search.rrf_k);
             println!();
             println!("[watch]");
             println!("paths = {:?}", config.watch.paths);
@@ -373,6 +364,9 @@ async fn run_embed(config: &Config, incremental: bool, limit: Option<usize>) -> 
         anyhow::bail!("Cannot connect to Ollama at {}. Is it running?", config.embeddings.ollama_url);
     }
     println!("Ollama is available.");
+
+    // Ensure model is pulled
+    embedder.ensure_model().await?;
 
     // Get chunks that need embeddings
     let chunks = if incremental {

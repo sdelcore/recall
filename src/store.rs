@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{ffi::sqlite3_auto_extension, params, Connection};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use zerocopy::AsBytes;
 
 /// Search result from the memory store
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,15 +35,29 @@ pub struct SearchOptions {
     pub file_pattern: Option<String>,
 }
 
-/// SQLite-based memory store
+/// SQLite-based memory store with sqlite-vec for vector search
 pub struct Store {
     conn: Connection,
     db_path: PathBuf,
 }
 
+/// Register sqlite-vec extension (must be called before opening any connection)
+fn register_sqlite_vec() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        unsafe {
+            sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+    });
+}
+
 impl Store {
     /// Open or create the memory store
     pub fn open() -> Result<Self> {
+        register_sqlite_vec();
+
         let db_path = Self::default_path()?;
 
         // Ensure parent directory exists
@@ -53,8 +69,12 @@ impl Store {
         let conn = Connection::open(&db_path)
             .context("Failed to open database")?;
 
+        // Enable foreign keys for CASCADE to work
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+
         let store = Store { conn, db_path };
         store.init_schema()?;
+        store.migrate_embeddings()?;
 
         Ok(store)
     }
@@ -63,7 +83,7 @@ impl Store {
     fn default_path() -> Result<PathBuf> {
         let data_dir = dirs::data_local_dir()
             .context("Could not determine local data directory")?;
-        Ok(data_dir.join("memory-search").join("memory.sqlite"))
+        Ok(data_dir.join("recall").join("memory.sqlite"))
     }
 
     /// Get the database path
@@ -128,15 +148,78 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);
             CREATE INDEX IF NOT EXISTS idx_chunks_date ON chunks(date);
             CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime);
-
-            -- Embeddings storage (stored as JSON array for simplicity)
-            -- Note: For production, consider sqlite-vec extension for better performance
-            CREATE TABLE IF NOT EXISTS embeddings (
-                chunk_id INTEGER PRIMARY KEY,
-                embedding BLOB NOT NULL,
-                FOREIGN KEY (chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
-            );
         "#).context("Failed to initialize schema")?;
+
+        // Create vec0 virtual table for vector embeddings (sqlite-vec)
+        // vec0 tables use CREATE VIRTUAL TABLE which doesn't support IF NOT EXISTS
+        // in the same way, so we check first
+        let has_vec_table: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='vec_embeddings'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !has_vec_table {
+            self.conn.execute_batch(
+                "CREATE VIRTUAL TABLE vec_embeddings USING vec0(embedding float[768]);"
+            ).context("Failed to create vec_embeddings table")?;
+        }
+
+        Ok(())
+    }
+
+    /// Migrate from old BLOB-based embeddings table to vec0
+    fn migrate_embeddings(&self) -> Result<()> {
+        let has_old_table: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='embeddings'",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if !has_old_table {
+            return Ok(());
+        }
+
+        let old_count: i64 = self.conn
+            .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
+            .unwrap_or(0);
+
+        if old_count == 0 {
+            self.conn.execute_batch("DROP TABLE IF EXISTS embeddings;")?;
+            return Ok(());
+        }
+
+        eprintln!("Migrating {} embeddings from BLOB to sqlite-vec format...", old_count);
+
+        let mut stmt = self.conn.prepare(
+            "SELECT chunk_id, embedding FROM embeddings"
+        )?;
+
+        let rows: Vec<(i64, Vec<u8>)> = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?.filter_map(|r| r.ok()).collect();
+
+        for (chunk_id, bytes) in &rows {
+            // Check if this chunk still exists (may have been orphaned)
+            let chunk_exists: bool = self.conn.query_row(
+                "SELECT COUNT(*) > 0 FROM chunks WHERE id = ?1",
+                params![chunk_id],
+                |row| row.get(0),
+            ).unwrap_or(false);
+
+            if !chunk_exists {
+                continue;
+            }
+
+            // The old format is already le bytes of f32, which is what vec0 expects
+            self.conn.execute(
+                "INSERT OR REPLACE INTO vec_embeddings(rowid, embedding) VALUES (?1, ?2)",
+                params![chunk_id, bytes],
+            )?;
+        }
+
+        self.conn.execute_batch("DROP TABLE embeddings;")?;
+        eprintln!("Migration complete.");
 
         Ok(())
     }
@@ -242,43 +325,35 @@ impl Store {
         Ok(search_results)
     }
 
-    /// Store embedding for a chunk
-    pub fn store_embedding(&self, chunk_id: i64, embedding: &[f32]) -> Result<()> {
-        // Serialize embedding as bytes (4 bytes per f32)
-        let bytes: Vec<u8> = embedding
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+    /// FTS5 search returning chunk IDs in BM25 rank order (for hybrid search)
+    fn search_fts_chunk_ids(&self, query: &str, limit: usize) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(r#"
+            SELECT c.id
+            FROM fts_chunks
+            JOIN chunks c ON c.id = fts_chunks.rowid
+            WHERE fts_chunks MATCH ?1
+            ORDER BY bm25(fts_chunks)
+            LIMIT ?2
+        "#)?;
 
-        self.conn.execute(
-            "INSERT OR REPLACE INTO embeddings (chunk_id, embedding) VALUES (?1, ?2)",
-            params![chunk_id, bytes],
-        )?;
+        let rows = stmt.query_map(params![query, limit as i64], |row| {
+            row.get::<_, i64>(0)
+        })?;
 
-        Ok(())
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        Ok(ids)
     }
 
-    /// Get embedding for a chunk
-    #[allow(dead_code)]
-    pub fn get_embedding(&self, chunk_id: i64) -> Result<Option<Vec<f32>>> {
-        let result: Result<Vec<u8>, _> = self.conn.query_row(
-            "SELECT embedding FROM embeddings WHERE chunk_id = ?1",
-            params![chunk_id],
-            |row| row.get(0),
-        );
-
-        match result {
-            Ok(bytes) => {
-                // Deserialize bytes to f32 array
-                let embedding: Vec<f32> = bytes
-                    .chunks_exact(4)
-                    .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-                    .collect();
-                Ok(Some(embedding))
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+    /// Store embedding for a chunk using sqlite-vec
+    pub fn store_embedding(&self, chunk_id: i64, embedding: &[f32]) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO vec_embeddings(rowid, embedding) VALUES (?1, ?2)",
+            params![chunk_id, embedding.as_bytes()],
+        )?;
+        Ok(())
     }
 
     /// Get all chunk IDs that don't have embeddings
@@ -286,8 +361,7 @@ impl Store {
         let mut stmt = self.conn.prepare(
             r#"SELECT c.id, c.content
                FROM chunks c
-               LEFT JOIN embeddings e ON c.id = e.chunk_id
-               WHERE e.chunk_id IS NULL"#,
+               WHERE c.id NOT IN (SELECT rowid FROM vec_embeddings)"#,
         )?;
 
         let results = stmt.query_map([], |row| {
@@ -309,100 +383,63 @@ impl Store {
             .unwrap_or(0);
 
         let embedded_chunks: i64 = self.conn
-            .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM vec_embeddings", [], |row| row.get(0))
             .unwrap_or(0);
 
         Ok((embedded_chunks, total_chunks))
     }
 
-    /// Vector search using cosine similarity
-    pub fn search_vector(
+    /// Vector search using sqlite-vec KNN, returning chunk IDs in rank order
+    fn search_vector_chunk_ids(
         &self,
         query_embedding: &[f32],
         limit: usize,
-    ) -> Result<Vec<(i64, f64)>> {
-        // Get all embeddings and compute similarity
+    ) -> Result<Vec<i64>> {
         let mut stmt = self.conn.prepare(
-            "SELECT chunk_id, embedding FROM embeddings"
+            "SELECT rowid FROM vec_embeddings WHERE embedding MATCH ?1 AND k = ?2"
         )?;
 
-        let results = stmt.query_map([], |row| {
-            let chunk_id: i64 = row.get(0)?;
-            let bytes: Vec<u8> = row.get(1)?;
-            Ok((chunk_id, bytes))
-        })?;
+        let rows = stmt.query_map(
+            params![query_embedding.as_bytes(), limit as i64],
+            |row| row.get::<_, i64>(0),
+        )?;
 
-        let mut scored: Vec<(i64, f64)> = Vec::new();
-
-        for result in results {
-            let (chunk_id, bytes) = result?;
-
-            // Deserialize embedding
-            let embedding: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
-                .collect();
-
-            // Compute cosine similarity
-            let similarity = crate::embedder::cosine_similarity(query_embedding, &embedding);
-            scored.push((chunk_id, similarity as f64));
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
         }
-
-        // Sort by similarity (descending) and take top N
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(limit);
-
-        Ok(scored)
+        Ok(ids)
     }
 
-    /// Hybrid search combining BM25 and vector search
+    /// Hybrid search combining BM25 and vector search using Reciprocal Rank Fusion
     pub fn search_hybrid(
         &self,
         query: &str,
         query_embedding: &[f32],
         limit: usize,
-        vector_weight: f64,
-        bm25_weight: f64,
+        rrf_k: u32,
     ) -> Result<Vec<SearchResult>> {
         // Get more candidates than needed for merging
         let candidate_count = limit * 3;
+        let k = rrf_k as f64;
 
-        // BM25 search
-        let bm25_results = self.search_fts_filtered(query, candidate_count, &SearchOptions::default())?;
+        // Get ranked lists from both search methods
+        let bm25_ranked = self.search_fts_chunk_ids(query, candidate_count)?;
+        let vector_ranked = self.search_vector_chunk_ids(query_embedding, candidate_count)?;
 
-        // Vector search
-        let vector_results = self.search_vector(query_embedding, candidate_count)?;
+        // Reciprocal Rank Fusion: score(doc) = Σ 1/(k + rank)
+        let mut rrf_scores: HashMap<i64, f64> = HashMap::new();
 
-        // Normalize scores and merge
-        let mut combined_scores: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
-
-        // Normalize and add BM25 scores
-        if !bm25_results.is_empty() {
-            let max_bm25 = bm25_results.iter().map(|r| r.score).fold(0.0_f64, f64::max);
-            if max_bm25 > 0.0 {
-                for result in bm25_results.iter() {
-                    // Get chunk ID from position (we need to look it up)
-                    if let Ok(chunk_id) = self.get_chunk_id_by_content(&result.content) {
-                        let normalized = result.score / max_bm25;
-                        *combined_scores.entry(chunk_id).or_insert(0.0) += normalized * bm25_weight;
-                    }
-                }
-            }
+        for (rank, chunk_id) in bm25_ranked.iter().enumerate() {
+            *rrf_scores.entry(*chunk_id).or_insert(0.0) += 1.0 / (k + rank as f64 + 1.0);
         }
 
-        // Normalize and add vector scores
-        if !vector_results.is_empty() {
-            let max_vector = vector_results.iter().map(|(_, s)| *s).fold(0.0_f64, f64::max);
-            if max_vector > 0.0 {
-                for (chunk_id, score) in &vector_results {
-                    let normalized = score / max_vector;
-                    *combined_scores.entry(*chunk_id).or_insert(0.0) += normalized * vector_weight;
-                }
-            }
+        for (rank, chunk_id) in vector_ranked.iter().enumerate() {
+            *rrf_scores.entry(*chunk_id).or_insert(0.0) += 1.0 / (k + rank as f64 + 1.0);
         }
 
-        // Sort by combined score
-        let mut ranked: Vec<(i64, f64)> = combined_scores.into_iter().collect();
+        // Sort by RRF score descending
+        let mut ranked: Vec<(i64, f64)> = rrf_scores.into_iter().collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         ranked.truncate(limit);
 
@@ -415,16 +452,6 @@ impl Store {
         }
 
         Ok(results)
-    }
-
-    /// Get chunk ID by content (helper for hybrid search)
-    fn get_chunk_id_by_content(&self, content: &str) -> Result<i64> {
-        let chunk_id: i64 = self.conn.query_row(
-            "SELECT id FROM chunks WHERE content = ?1 LIMIT 1",
-            params![content],
-            |row| row.get(0),
-        )?;
-        Ok(chunk_id)
     }
 
     /// Get chunk by ID with score
@@ -456,6 +483,25 @@ impl Store {
         }
     }
 
+    /// Delete vec_embeddings for chunks belonging to a file
+    fn delete_embeddings_for_file(&self, file_path: &str) -> Result<()> {
+        // Get chunk IDs for this file
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id FROM chunks c JOIN files f ON f.id = c.file_id WHERE f.file_path = ?1"
+        )?;
+        let chunk_ids: Vec<i64> = stmt.query_map(params![file_path], |row| {
+            row.get::<_, i64>(0)
+        })?.filter_map(|r| r.ok()).collect();
+
+        for chunk_id in chunk_ids {
+            self.conn.execute(
+                "DELETE FROM vec_embeddings WHERE rowid = ?1",
+                params![chunk_id],
+            ).ok(); // Ignore errors for missing rows
+        }
+        Ok(())
+    }
+
     /// Index a single file
     pub fn index_file(&self, file_path: &str) -> Result<()> {
         let path = std::path::Path::new(file_path);
@@ -471,10 +517,13 @@ impl Store {
         let content = std::fs::read_to_string(path)?;
         let chunks = chunk_markdown(&content, file_path);
 
+        // Clean up vec_embeddings before deleting chunks (no CASCADE for virtual tables)
+        self.delete_embeddings_for_file(file_path)?;
+
         // Begin transaction
         self.conn.execute("BEGIN", [])?;
 
-        // Delete existing file entry if exists
+        // Delete existing file entry if exists (CASCADE deletes chunks and FTS)
         self.conn.execute("DELETE FROM files WHERE file_path = ?1", params![file_path])?;
 
         // Insert file record
@@ -510,7 +559,9 @@ impl Store {
 
     /// Full index of a directory
     pub fn index_full(&self, dir_path: &str) -> Result<()> {
-        // Clear existing data
+        // Clear vec_embeddings first (no CASCADE)
+        self.conn.execute("DELETE FROM vec_embeddings", [])?;
+        // Clear chunks and files
         self.conn.execute("DELETE FROM chunks", [])?;
         self.conn.execute("DELETE FROM files", [])?;
 
@@ -584,7 +635,12 @@ struct Chunk {
     project: Option<String>,
 }
 
-/// Chunk markdown content into sections
+/// Number of overlap characters when splitting at size boundary (~15% of 1600)
+const CHUNK_OVERLAP_CHARS: usize = 240;
+/// Maximum chunk size in characters (~400 tokens)
+const MAX_CHUNK_CHARS: usize = 1600;
+
+/// Chunk markdown content into sections with overlap at size boundaries
 fn chunk_markdown(content: &str, file_path: &str) -> Vec<Chunk> {
     let mut chunks = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
@@ -603,38 +659,15 @@ fn chunk_markdown(content: &str, file_path: &str) -> Vec<Chunk> {
     let mut current_section: Option<String> = None;
     let mut current_chunk_start = 0;
     let mut current_chunk_lines: Vec<&str> = Vec::new();
+    // Lines to prepend as overlap from previous size-split chunk
+    let mut overlap_lines: Vec<&str> = Vec::new();
 
     for (i, line) in lines.iter().enumerate() {
         // Check for section headers
         if line.starts_with("## ") {
-            // Save previous chunk if non-empty
+            // Save previous chunk if non-empty (no overlap at header boundaries)
             if !current_chunk_lines.is_empty() {
                 let content = current_chunk_lines.join("\n");
-                if !content.trim().is_empty() {
-                    chunks.push(Chunk {
-                        content,
-                        start_line: (current_chunk_start + 1) as i64,
-                        end_line: i as i64,
-                        date: date.clone(),
-                        section: current_section.clone(),
-                        project: None, // TODO: Extract project tags
-                    });
-                }
-            }
-
-            // Start new section
-            current_section = Some(line[3..].trim().to_string());
-            current_chunk_start = i;
-            current_chunk_lines = vec![*line];
-        } else {
-            current_chunk_lines.push(*line);
-
-            // If chunk is getting too long, split it
-            // Using a simple character count approximation for tokens
-            let chunk_text = current_chunk_lines.join("\n");
-            if chunk_text.len() > 1600 {
-                // ~400 tokens
-                let content = current_chunk_lines[..current_chunk_lines.len() - 1].join("\n");
                 if !content.trim().is_empty() {
                     chunks.push(Chunk {
                         content,
@@ -645,8 +678,50 @@ fn chunk_markdown(content: &str, file_path: &str) -> Vec<Chunk> {
                         project: None,
                     });
                 }
-                current_chunk_start = i;
-                current_chunk_lines = vec![*line];
+            }
+
+            // Start new section — clear overlap since header is a semantic boundary
+            current_section = Some(line[3..].trim().to_string());
+            current_chunk_start = i;
+            current_chunk_lines = vec![*line];
+            overlap_lines.clear();
+        } else {
+            current_chunk_lines.push(*line);
+
+            // If chunk is getting too long, split it
+            let chunk_text = current_chunk_lines.join("\n");
+            if chunk_text.len() > MAX_CHUNK_CHARS {
+                let split_lines = &current_chunk_lines[..current_chunk_lines.len() - 1];
+                let content = split_lines.join("\n");
+                if !content.trim().is_empty() {
+                    chunks.push(Chunk {
+                        content,
+                        start_line: (current_chunk_start + 1) as i64,
+                        end_line: i as i64,
+                        date: date.clone(),
+                        section: current_section.clone(),
+                        project: None,
+                    });
+                }
+
+                // Compute overlap: take lines from the end of the emitted chunk
+                // that total ~CHUNK_OVERLAP_CHARS characters
+                overlap_lines.clear();
+                let mut overlap_len = 0;
+                for &ol in split_lines.iter().rev() {
+                    overlap_len += ol.len() + 1; // +1 for newline
+                    overlap_lines.push(ol);
+                    if overlap_len >= CHUNK_OVERLAP_CHARS {
+                        break;
+                    }
+                }
+                overlap_lines.reverse();
+
+                // Start new chunk with overlap + current line
+                current_chunk_start = i.saturating_sub(overlap_lines.len());
+                current_chunk_lines = overlap_lines.clone();
+                current_chunk_lines.push(*line);
+                overlap_lines.clear();
             }
         }
     }

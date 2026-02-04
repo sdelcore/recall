@@ -1,95 +1,59 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code when working with the memory-search project.
+Project-level guidance for the recall semantic memory search CLI.
 
-## Overview
+## Build Commands
 
-`memory-search` is a semantic memory search CLI that indexes markdown files (primarily Obsidian vaults) and provides token-efficient retrieval for LLM consumption.
+```bash
+# Enter nix development environment
+cd aria/recall && nix develop
 
-## Architecture
+# Build
+cargo build
 
-- **SQLite + FTS5** for BM25 keyword search
-- **sqlite-vec** (future) for vector embeddings
-- **Hybrid search** combining BM25 + vector with weighted merging
-- **Token-efficient output** - returns small bundles with citations, not full documents
+# Run tests
+cargo test
+
+# Lint
+cargo clippy
+
+# Format
+cargo fmt
+```
 
 ## Project Structure
 
 ```
-src/
-├── main.rs      # CLI entry point (clap)
-├── store.rs     # SQLite wrapper + schema
-├── chunker.rs   # Markdown-aware chunking
-├── embedder.rs  # Ollama HTTP client
-├── search.rs    # Hybrid BM25 + vector search
-└── watcher.rs   # File watching with debounce
+recall/
+├── src/
+│   ├── main.rs       # CLI entry point (clap), command dispatch
+│   ├── store.rs      # SQLite + FTS5 + sqlite-vec database, chunking logic
+│   ├── config.rs     # TOML configuration loading
+│   ├── embedder.rs   # Ollama HTTP client for embeddings
+│   └── watcher.rs    # File system watcher (notify-rs)
+├── docs/
+│   ├── ARCHITECTURE.md  # Technical architecture and schema
+│   └── DEVELOPMENT.md   # Development guide
+├── Cargo.toml
+├── flake.nix
+└── README.md
 ```
 
-## Commands
+## Architecture
 
-```bash
-# Development
-nix develop              # Enter dev shell
-cargo build              # Build
-cargo run -- status      # Run status command
-cargo run -- index       # Index files
-cargo run -- "query"     # Search
+- **Store** (`store.rs`): SQLite database with FTS5 for BM25 search and sqlite-vec for vector KNN search. Also contains the `chunk_markdown()` chunking logic.
+- **Config** (`config.rs`): TOML config from `~/.config/recall/config.toml`
+- **Embedder** (`embedder.rs`): HTTP client for Ollama embedding API (nomic-embed-text, 768-dim)
+- **Watcher** (`watcher.rs`): File system watcher with debouncing for auto-indexing
 
-# Testing
-cargo test
-cargo clippy
-```
+## Database
 
-## Key Design Decisions
+Tables: `files`, `chunks`, `fts_chunks` (FTS5), `vec_embeddings` (vec0), `config`
 
-1. **Standalone project** - Not part of aria workspace, has its own flake.nix
-2. **Local SQLite** - Database at `~/.local/share/memory-search/memory.sqlite`
-3. **Remote embeddings** - HTTP to Ollama at nightman.tap:11434
-4. **Token-efficient output** - Compact format with citations by default
+Location: `~/.local/share/recall/memory.sqlite`
 
-## Configuration
+## Key Patterns
 
-Config file: `~/.config/memory-search/config.toml`
-
-```toml
-[index]
-# Paths to index for semantic search
-paths = ["~/Obsidian"]
-# Glob patterns to exclude from indexing
-exclude = ["**/Templates/**", "**/.obsidian/**", "**/attachments/**"]
-
-[embeddings]
-# Ollama server URL for generating embeddings
-ollama_url = "http://nightman.tap:11434"
-# Embedding model name
-model = "nomic-embed-text"
-
-[search]
-# Default number of results to return
-default_limit = 5
-# Vector weight for hybrid search (0.0-1.0)
-vector_weight = 0.7
-# BM25 weight for hybrid search (0.0-1.0)
-bm25_weight = 0.3
-
-[watch]
-# Paths to watch for file changes (auto-index on change)
-paths = ["~/Obsidian"]
-# Patterns to exclude from watching (substring match)
-exclude = ["Templates/", ".obsidian/", "attachments/", ".sync-conflict-"]
-# Debounce time in milliseconds before indexing changed files
-debounce_ms = 1500
-```
-
-Config commands:
-```bash
-memory-search config show   # Display current config
-memory-search config path   # Show config file location
-memory-search status        # Status including paths
-```
-
-## References
-
-- Design doc: `~/Obsidian/ARIA/Improvements/memory-search-design.md`
-- Clawdbot memory: https://docs.clawd.bot/experiments/research/memory
-- sqlite-vec: https://github.com/asg017/sqlite-vec
+- Hybrid search uses **Reciprocal Rank Fusion (RRF)** with configurable `rrf_k` parameter
+- Chunking splits on `##` headers with ~240 char overlap at size boundaries
+- FTS5 is kept in sync via triggers on the `chunks` table

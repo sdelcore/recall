@@ -10,7 +10,7 @@
     in {
       packages = forAllSystems (pkgs: {
         default = pkgs.rustPlatform.buildRustPackage {
-          pname = "memory-search";
+          pname = "recall";
           version = "0.1.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
@@ -21,7 +21,7 @@
           meta = with pkgs.lib; {
             description = "Semantic memory search CLI with token-efficient retrieval";
             license = licenses.mit;
-            mainProgram = "memory-search";
+            mainProgram = "recall";
           };
         };
       });

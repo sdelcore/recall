@@ -24,7 +24,7 @@ struct EmbeddingResponse {
 impl Embedder {
     /// Create a new embedder with default settings
     pub fn new() -> Self {
-        Self::with_url_and_model("http://nightman.tap:11434", "nomic-embed-text")
+        Self::with_url_and_model("http://localhost:11434", "nomic-embed-text")
     }
 
     /// Create embedder from Config
@@ -95,6 +95,51 @@ impl Embedder {
         }
     }
 
+    /// Ensure the configured model is available, pulling it if needed
+    pub async fn ensure_model(&self) -> Result<()> {
+        let url = format!("{}/api/show", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({"name": self.model}))
+            .send()
+            .await
+            .context("Failed to check model availability")?;
+
+        if response.status().is_success() {
+            return Ok(());
+        }
+
+        // Model not found — pull it
+        eprintln!("Model '{}' not found locally, pulling...", self.model);
+        let pull_url = format!("{}/api/pull", self.base_url);
+        let pull_response = self
+            .client
+            .post(&pull_url)
+            .json(&serde_json::json!({"name": self.model}))
+            .send()
+            .await
+            .context("Failed to start model pull")?;
+
+        if !pull_response.status().is_success() {
+            let body = pull_response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to pull model '{}': {}", self.model, body);
+        }
+
+        // The pull endpoint streams progress as NDJSON — read until complete
+        let body = pull_response.text().await.unwrap_or_default();
+        for line in body.lines() {
+            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(status) = obj.get("status").and_then(|s| s.as_str()) {
+                    eprintln!("  {}", status);
+                }
+            }
+        }
+
+        eprintln!("Model '{}' pulled successfully.", self.model);
+        Ok(())
+    }
+
     /// Get embedding dimensions for the configured model
     #[allow(dead_code)]
     pub fn dimensions(&self) -> usize {
@@ -103,19 +148,3 @@ impl Embedder {
     }
 }
 
-/// Calculate cosine similarity between two vectors
-pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() {
-        return 0.0;
-    }
-
-    let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-    if norm_a == 0.0 || norm_b == 0.0 {
-        return 0.0;
-    }
-
-    dot_product / (norm_a * norm_b)
-}

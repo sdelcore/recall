@@ -40,12 +40,9 @@ pub struct SearchConfig {
     /// Default number of results
     #[serde(default = "default_limit")]
     pub default_limit: usize,
-    /// Vector weight for hybrid search (0.0-1.0)
-    #[serde(default = "default_vector_weight")]
-    pub vector_weight: f64,
-    /// BM25 weight for hybrid search (0.0-1.0)
-    #[serde(default = "default_bm25_weight")]
-    pub bm25_weight: f64,
+    /// RRF constant k (higher = more weight to lower-ranked results)
+    #[serde(default = "default_rrf_k")]
+    pub rrf_k: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,7 +72,7 @@ fn default_exclude_patterns() -> Vec<String> {
 }
 
 fn default_ollama_url() -> String {
-    "http://nightman.tap:11434".to_string()
+    "http://localhost:11434".to_string()
 }
 
 fn default_embedding_model() -> String {
@@ -86,12 +83,8 @@ fn default_limit() -> usize {
     5
 }
 
-fn default_vector_weight() -> f64 {
-    0.7
-}
-
-fn default_bm25_weight() -> f64 {
-    0.3
+fn default_rrf_k() -> u32 {
+    60
 }
 
 fn default_watch_paths() -> Vec<String> {
@@ -144,8 +137,7 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             default_limit: default_limit(),
-            vector_weight: default_vector_weight(),
-            bm25_weight: default_bm25_weight(),
+            rrf_k: default_rrf_k(),
         }
     }
 }
@@ -188,7 +180,7 @@ impl Config {
     pub fn config_path() -> PathBuf {
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("memory-search")
+            .join("recall")
             .join("config.toml")
     }
 
