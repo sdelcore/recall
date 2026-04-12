@@ -3,6 +3,8 @@ use clap::{Parser, Subcommand};
 
 mod config;
 mod embedder;
+mod mcp;
+mod reranker;
 mod store;
 mod watcher;
 
@@ -51,6 +53,14 @@ enum Commands {
         /// Use hybrid search (BM25 + vector)
         #[arg(long)]
         hybrid: bool,
+
+        /// Rerank results using LLM (uses config provider, or --rerank-provider)
+        #[arg(long)]
+        rerank: bool,
+
+        /// Override reranking provider (claude-code, anthropic, ollama)
+        #[arg(long)]
+        rerank_provider: Option<String>,
     },
 
     /// Generate embeddings for indexed chunks
@@ -94,6 +104,13 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+
+    /// Start MCP server (stdio transport) for Claude Code integration
+    Serve {
+        /// Transport mode
+        #[arg(long, default_value = "mcp")]
+        mode: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -109,10 +126,18 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::load()?;
 
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     // Handle direct query (no subcommand)
     if !cli.query.is_empty() {
         let query = cli.query.join(" ");
-        return run_search(&config, &query, None, "compact", None, None, None, false).await;
+        return run_search(&config, &query, None, "compact", None, None, None, false, false, None).await;
     }
 
     match cli.command {
@@ -124,8 +149,10 @@ async fn main() -> Result<()> {
             project,
             file,
             hybrid,
+            rerank,
+            rerank_provider,
         }) => {
-            run_search(&config, &query, limit, &format, after, project, file, hybrid).await
+            run_search(&config, &query, limit, &format, after, project, file, hybrid, rerank, rerank_provider).await
         }
         Some(Commands::Index {
             path,
@@ -146,6 +173,12 @@ async fn main() -> Result<()> {
         Some(Commands::Config { action }) => {
             run_config(&config, action)
         }
+        Some(Commands::Serve { mode }) => {
+            if mode != "mcp" {
+                anyhow::bail!("Unknown serve mode: {}. Only 'mcp' is supported.", mode);
+            }
+            mcp::serve_mcp(&config).await
+        }
         None => {
             // No command and no query - show help
             use clap::CommandFactory;
@@ -164,9 +197,19 @@ async fn run_search(
     project: Option<String>,
     file: Option<String>,
     hybrid: bool,
+    rerank: bool,
+    rerank_provider: Option<String>,
 ) -> Result<()> {
     let store = store::Store::open()?;
     let limit = limit.unwrap_or(config.search.default_limit);
+    let do_rerank = rerank || config.reranking.enabled;
+
+    // When reranking, fetch more candidates so the reranker has material to work with
+    let fetch_limit = if do_rerank {
+        config.reranking.candidates.max(limit)
+    } else {
+        limit
+    };
 
     // Build search options from filters
     let options = store::SearchOptions {
@@ -175,7 +218,7 @@ async fn run_search(
         file_pattern: file,
     };
 
-    let results = if hybrid {
+    let mut results = if hybrid {
         // Hybrid search with embeddings
         let embedder = embedder::Embedder::new_with_config(config);
 
@@ -184,17 +227,38 @@ async fn run_search(
         if embedded == 0 {
             eprintln!("Warning: No embeddings found. Run 'recall embed' first.");
             eprintln!("Falling back to BM25 search.\n");
-            store.search_fts_filtered(query, limit, &options)?
+            store.search_fts_filtered(query, fetch_limit, &options)?
         } else {
             // Generate query embedding
             let query_embedding = embedder.embed(query).await?;
 
-            store.search_hybrid(query, &query_embedding, limit, config.search.rrf_k)?
+            store.search_hybrid(query, &query_embedding, fetch_limit, config.search.rrf_k)?
         }
     } else {
         // BM25 only
-        store.search_fts_filtered(query, limit, &options)?
+        store.search_fts_filtered(query, fetch_limit, &options)?
     };
+
+    // LLM reranking
+    if do_rerank && !results.is_empty() {
+        let mut rerank_config = config.reranking.clone();
+        // Override provider if specified on CLI
+        if let Some(provider) = rerank_provider {
+            rerank_config.provider = provider;
+        }
+        // Ensure top_k respects the user's requested limit
+        rerank_config.top_k = limit;
+
+        eprintln!(
+            "Reranking {} candidates via {} (top {})...",
+            results.len(),
+            rerank_config.provider,
+            rerank_config.top_k,
+        );
+        results = reranker::rerank(query, results, &rerank_config).await;
+    } else if !do_rerank {
+        results.truncate(limit);
+    }
 
     match format {
         "json" => {

@@ -13,6 +13,58 @@ pub struct Config {
     pub search: SearchConfig,
     #[serde(default)]
     pub watch: WatchConfig,
+    #[serde(default)]
+    pub reranking: RerankConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankConfig {
+    /// Enable LLM reranking
+    #[serde(default)]
+    pub enabled: bool,
+    /// Provider: "claude-code" (default), "anthropic", "ollama"
+    #[serde(default = "default_rerank_provider")]
+    pub provider: String,
+    /// How many RRF candidates to send to the reranker
+    #[serde(default = "default_rerank_candidates")]
+    pub candidates: usize,
+    /// How many results to return after reranking
+    #[serde(default = "default_rerank_top_k")]
+    pub top_k: usize,
+    /// Claude Code SDK settings
+    #[serde(default)]
+    pub claude_code: Option<ClaudeCodeRerankConfig>,
+    /// Anthropic API settings
+    #[serde(default)]
+    pub anthropic: Option<AnthropicRerankConfig>,
+    /// Ollama settings
+    #[serde(default)]
+    pub ollama: Option<OllamaRerankConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeCodeRerankConfig {
+    /// Model to use (default: "haiku")
+    #[serde(default = "default_haiku_model")]
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnthropicRerankConfig {
+    /// Model name
+    pub model: Option<String>,
+    /// Env var containing API key (default: ANTHROPIC_API_KEY)
+    pub api_key_env: Option<String>,
+    /// Max concurrent API calls
+    pub max_concurrent: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OllamaRerankConfig {
+    /// Ollama URL
+    pub url: Option<String>,
+    /// Model name
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +156,36 @@ fn default_debounce_ms() -> u64 {
     1500
 }
 
+fn default_rerank_provider() -> String {
+    "claude-code".to_string()
+}
+
+fn default_rerank_candidates() -> usize {
+    20
+}
+
+fn default_rerank_top_k() -> usize {
+    5
+}
+
+fn default_haiku_model() -> String {
+    "haiku".to_string()
+}
+
+impl Default for RerankConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            provider: default_rerank_provider(),
+            candidates: default_rerank_candidates(),
+            top_k: default_rerank_top_k(),
+            claude_code: None,
+            anthropic: None,
+            ollama: None,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -111,6 +193,7 @@ impl Default for Config {
             embeddings: EmbeddingsConfig::default(),
             search: SearchConfig::default(),
             watch: WatchConfig::default(),
+            reranking: RerankConfig::default(),
         }
     }
 }
