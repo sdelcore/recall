@@ -513,6 +513,7 @@ mod tests {
                 date: None,
                 section: None,
                 project: None,
+                memory_type: None,
             },
             SearchResult {
                 file_path: "b.md".into(),
@@ -523,6 +524,7 @@ mod tests {
                 date: None,
                 section: None,
                 project: None,
+                memory_type: None,
             },
         ];
         let prompt = build_rerank_prompt("test query", &candidates);

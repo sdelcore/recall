@@ -245,6 +245,7 @@ async fn tool_search(args: &Value, config: &Config) -> Result<String> {
                 "score": format!("{:.2}", r.score),
                 "section": r.section,
                 "date": r.date,
+                "memory_type": r.memory_type,
                 "content": r.content,
             })
         }).collect::<Vec<_>>()

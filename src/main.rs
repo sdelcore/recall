@@ -272,6 +272,7 @@ async fn run_search(
                         "snippet": r.content,
                         "date": r.date,
                         "section": r.section,
+                        "memory_type": r.memory_type,
                     })
                 }).collect::<Vec<_>>()
             });

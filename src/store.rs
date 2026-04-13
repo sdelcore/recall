@@ -17,6 +17,7 @@ pub struct SearchResult {
     pub date: Option<String>,
     pub section: Option<String>,
     pub project: Option<String>,
+    pub memory_type: Option<String>,
 }
 
 /// Statistics about the memory store
@@ -75,6 +76,7 @@ impl Store {
         let store = Store { conn, db_path };
         store.init_schema()?;
         store.migrate_embeddings()?;
+        store.migrate_memory_type()?;
 
         Ok(store)
     }
@@ -224,6 +226,22 @@ impl Store {
         Ok(())
     }
 
+    /// Add memory_type column if not present
+    fn migrate_memory_type(&self) -> Result<()> {
+        let has_col: bool = self.conn
+            .prepare("SELECT memory_type FROM chunks LIMIT 0")
+            .is_ok();
+        if !has_col {
+            self.conn.execute_batch(
+                "ALTER TABLE chunks ADD COLUMN memory_type TEXT;"
+            )?;
+            self.conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_chunks_memory_type ON chunks(memory_type);"
+            )?;
+        }
+        Ok(())
+    }
+
     /// Get store statistics
     pub fn get_stats(&self) -> Result<StoreStats> {
         let file_count: i64 = self.conn
@@ -266,7 +284,8 @@ impl Store {
                 bm25(fts_chunks) as score,
                 c.date,
                 c.section,
-                c.project
+                c.project,
+                c.memory_type
             FROM fts_chunks
             JOIN chunks c ON c.id = fts_chunks.rowid
             JOIN files f ON f.id = c.file_id
@@ -314,6 +333,7 @@ impl Store {
                 date: row.get(5)?,
                 section: row.get(6)?,
                 project: row.get(7)?,
+                memory_type: row.get(8)?,
             })
         })?;
 
@@ -457,7 +477,7 @@ impl Store {
     /// Get chunk by ID with score
     fn get_chunk_by_id(&self, chunk_id: i64, score: f64) -> Result<Option<SearchResult>> {
         let result = self.conn.query_row(
-            r#"SELECT f.file_path, c.start_line, c.end_line, c.content, c.date, c.section, c.project
+            r#"SELECT f.file_path, c.start_line, c.end_line, c.content, c.date, c.section, c.project, c.memory_type
                FROM chunks c
                JOIN files f ON f.id = c.file_id
                WHERE c.id = ?1"#,
@@ -472,6 +492,7 @@ impl Store {
                     date: row.get(4)?,
                     section: row.get(5)?,
                     project: row.get(6)?,
+                    memory_type: row.get(7)?,
                 })
             },
         );
@@ -537,8 +558,8 @@ impl Store {
         // Insert chunks
         for (i, chunk) in chunks.iter().enumerate() {
             self.conn.execute(
-                r#"INSERT INTO chunks (file_id, chunk_index, date, section, project, start_line, end_line, content)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+                r#"INSERT INTO chunks (file_id, chunk_index, date, section, project, start_line, end_line, content, memory_type)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
                 params![
                     file_id,
                     i as i64,
@@ -548,6 +569,7 @@ impl Store {
                     chunk.start_line,
                     chunk.end_line,
                     chunk.content,
+                    chunk.memory_type,
                 ],
             )?;
         }
@@ -633,6 +655,46 @@ struct Chunk {
     date: Option<String>,
     section: Option<String>,
     project: Option<String>,
+    memory_type: Option<String>,
+}
+
+/// Classify a file into a memory type based on its path.
+/// Returns: "semantic", "procedural", "episodic", "skill", or None for general content.
+fn classify_memory_type(file_path: &str) -> Option<String> {
+    let path_lower = file_path.to_lowercase();
+
+    // Skills directory
+    if path_lower.contains("/aria/skills/") {
+        return Some("skill".to_string());
+    }
+
+    // ARIA core files
+    if path_lower.ends_with("/memory.md") && path_lower.contains("/aria/") {
+        return Some("semantic".to_string());
+    }
+    if path_lower.ends_with("/soul.md") || path_lower.ends_with("/user.md") {
+        return Some("semantic".to_string());
+    }
+    if path_lower.ends_with("/issues.md") && path_lower.contains("/aria/") {
+        return Some("procedural".to_string());
+    }
+
+    // Daily notes (both user and ARIA)
+    if path_lower.contains("/daily notes/") || path_lower.contains("/periodic/daily/") {
+        return Some("episodic".to_string());
+    }
+
+    // Messages
+    if path_lower.contains("/aria/messages/") {
+        return Some("episodic".to_string());
+    }
+
+    // Contacts
+    if path_lower.contains("/aria/contacts/") {
+        return Some("semantic".to_string());
+    }
+
+    None
 }
 
 /// Number of overlap characters when splitting at size boundary (~15% of 1600)
@@ -648,6 +710,8 @@ fn chunk_markdown(content: &str, file_path: &str) -> Vec<Chunk> {
     if lines.is_empty() {
         return chunks;
     }
+
+    let memory_type = classify_memory_type(file_path);
 
     // Extract date from filename (YYYY-MM-DD.md pattern)
     let date = std::path::Path::new(file_path)
@@ -676,6 +740,7 @@ fn chunk_markdown(content: &str, file_path: &str) -> Vec<Chunk> {
                         date: date.clone(),
                         section: current_section.clone(),
                         project: None,
+                        memory_type: memory_type.clone(),
                     });
                 }
             }
@@ -701,6 +766,7 @@ fn chunk_markdown(content: &str, file_path: &str) -> Vec<Chunk> {
                         date: date.clone(),
                         section: current_section.clone(),
                         project: None,
+                        memory_type: memory_type.clone(),
                     });
                 }
 
@@ -737,6 +803,7 @@ fn chunk_markdown(content: &str, file_path: &str) -> Vec<Chunk> {
                 date: date.clone(),
                 section: current_section,
                 project: None,
+                memory_type: memory_type.clone(),
             });
         }
     }
