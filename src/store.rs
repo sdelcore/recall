@@ -935,6 +935,63 @@ impl Store {
         }
         Ok(best)
     }
+
+    // ── Maintenance ───────────────────────────────────────────────────────
+
+    /// `PRAGMA integrity_check` — returns "ok" on a healthy DB.
+    pub fn integrity_check(&self) -> Result<String> {
+        let result: String = self
+            .conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        Ok(result)
+    }
+
+    /// Counts of rows that should not exist if FK constraints held: chunks
+    /// pointing to a missing file, files pointing to a missing collection,
+    /// and embeddings pointing to a missing chunk.
+    pub fn orphan_counts(&self) -> Result<OrphanCounts> {
+        let chunks: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM chunks WHERE file_id NOT IN (SELECT id FROM files)",
+            [],
+            |row| row.get(0),
+        )?;
+        let files: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE collection_id NOT IN (SELECT id FROM collections)",
+            [],
+            |row| row.get(0),
+        )?;
+        let embeddings: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM vec_embeddings WHERE rowid NOT IN (SELECT id FROM chunks)",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(OrphanCounts {
+            chunks,
+            files,
+            embeddings,
+        })
+    }
+
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM;")?;
+        Ok(())
+    }
+
+    /// Drop and rebuild the FTS5 index from `chunks`.
+    pub fn rebuild_fts(&self) -> Result<()> {
+        self.conn
+            .execute_batch("INSERT INTO fts_chunks(fts_chunks) VALUES('rebuild');")?;
+        Ok(())
+    }
+}
+
+/// Counts of rows that violate referential integrity. Always non-negative;
+/// any non-zero value means the DB needs cleanup (or there's a code bug).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrphanCounts {
+    pub chunks: i64,
+    pub files: i64,
+    pub embeddings: i64,
 }
 
 /// A chunk of text with metadata
