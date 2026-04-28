@@ -36,6 +36,16 @@ pub struct SearchOptions {
     pub file_pattern: Option<String>,
 }
 
+/// Per-result diagnostic info for `--trace`. Fields are populated by whichever
+/// search path produced the result; ranks are 0-based.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SearchTrace {
+    pub bm25_rank: Option<usize>,
+    pub vec_rank: Option<usize>,
+    pub rrf_score: f64,
+    pub rerank_score: Option<f64>,
+}
+
 /// SQLite-based memory store with sqlite-vec for vector search
 pub struct Store {
     conn: Connection,
@@ -463,39 +473,92 @@ impl Store {
         limit: usize,
         rrf_k: u32,
     ) -> Result<Vec<SearchResult>> {
-        // Get more candidates than needed for merging
+        Ok(self
+            .search_hybrid_traced(query, query_embedding, limit, rrf_k)?
+            .into_iter()
+            .map(|(r, _t)| r)
+            .collect())
+    }
+
+    /// Same as [`search_hybrid`] but also returns per-result trace info for
+    /// `--trace`: BM25 rank, vector rank, fused RRF score.
+    pub fn search_hybrid_traced(
+        &self,
+        query: &str,
+        query_embedding: &[f32],
+        limit: usize,
+        rrf_k: u32,
+    ) -> Result<Vec<(SearchResult, SearchTrace)>> {
         let candidate_count = limit * 3;
         let k = rrf_k as f64;
 
-        // Get ranked lists from both search methods
         let bm25_ranked = self.search_fts_chunk_ids(query, candidate_count)?;
         let vector_ranked = self.search_vector_chunk_ids(query_embedding, candidate_count)?;
 
-        // Reciprocal Rank Fusion: score(doc) = Σ 1/(k + rank)
-        let mut rrf_scores: HashMap<i64, f64> = HashMap::new();
+        let bm25_idx: HashMap<i64, usize> = bm25_ranked
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, i))
+            .collect();
+        let vec_idx: HashMap<i64, usize> = vector_ranked
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, i))
+            .collect();
 
+        // RRF: score(doc) = Σ 1/(k + rank + 1)
+        let mut rrf_scores: HashMap<i64, f64> = HashMap::new();
         for (rank, chunk_id) in bm25_ranked.iter().enumerate() {
             *rrf_scores.entry(*chunk_id).or_insert(0.0) += 1.0 / (k + rank as f64 + 1.0);
         }
-
         for (rank, chunk_id) in vector_ranked.iter().enumerate() {
             *rrf_scores.entry(*chunk_id).or_insert(0.0) += 1.0 / (k + rank as f64 + 1.0);
         }
 
-        // Sort by RRF score descending
         let mut ranked: Vec<(i64, f64)> = rrf_scores.into_iter().collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         ranked.truncate(limit);
 
-        // Fetch full results
-        let mut results = Vec::new();
-        for (chunk_id, score) in ranked {
-            if let Ok(Some(result)) = self.get_chunk_by_id(chunk_id, score) {
-                results.push(result);
+        let mut out = Vec::new();
+        for (chunk_id, rrf_score) in ranked {
+            if let Ok(Some(result)) = self.get_chunk_by_id(chunk_id, rrf_score) {
+                let trace = SearchTrace {
+                    bm25_rank: bm25_idx.get(&chunk_id).copied(),
+                    vec_rank: vec_idx.get(&chunk_id).copied(),
+                    rrf_score,
+                    rerank_score: None,
+                };
+                out.push((result, trace));
             }
         }
+        Ok(out)
+    }
 
-        Ok(results)
+    /// BM25-only search returning trace info. `vec_rank` is always `None`;
+    /// `rrf_score` is the single-list reciprocal rank `1/(k + rank + 1)` so
+    /// trace numbers are comparable across modes.
+    pub fn search_fts_traced(
+        &self,
+        query: &str,
+        limit: usize,
+        rrf_k: u32,
+        options: &SearchOptions,
+    ) -> Result<Vec<(SearchResult, SearchTrace)>> {
+        let results = self.search_fts_filtered(query, limit, options)?;
+        let k = rrf_k as f64;
+        Ok(results
+            .into_iter()
+            .enumerate()
+            .map(|(rank, r)| {
+                let trace = SearchTrace {
+                    bm25_rank: Some(rank),
+                    vec_rank: None,
+                    rrf_score: 1.0 / (k + rank as f64 + 1.0),
+                    rerank_score: None,
+                };
+                (r, trace)
+            })
+            .collect())
     }
 
     /// Get chunk by ID with score
