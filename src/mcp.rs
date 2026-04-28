@@ -272,6 +272,10 @@ async fn tool_search(args: &Value, config: &Config) -> Result<String> {
                 "section": r.section,
                 "date": r.date,
                 "memory_type": r.memory_type,
+                "collection": {
+                    "name": r.collection_name,
+                    "description": r.collection_description,
+                },
                 "content": r.content,
             })
         }).collect::<Vec<_>>()

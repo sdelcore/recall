@@ -517,6 +517,8 @@ mod tests {
                 section: None,
                 project: None,
                 memory_type: None,
+                collection_name: None,
+                collection_description: None,
             },
             SearchResult {
                 file_path: "b.md".into(),
@@ -528,6 +530,8 @@ mod tests {
                 section: None,
                 project: None,
                 memory_type: None,
+                collection_name: None,
+                collection_description: None,
             },
         ];
         let prompt = build_rerank_prompt("test query", &candidates);
