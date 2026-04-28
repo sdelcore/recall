@@ -71,10 +71,8 @@ pub async fn rerank(
             }
 
             // Pair scores with results, sort descending, take top_k
-            let mut scored: Vec<(f64, SearchResult)> = scores
-                .into_iter()
-                .zip(rerank_input)
-                .collect();
+            let mut scored: Vec<(f64, SearchResult)> =
+                scores.into_iter().zip(rerank_input).collect();
             scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
             info!(
@@ -85,10 +83,14 @@ pub async fn rerank(
                 scored.last().map(|s| s.0).unwrap_or(0.0),
             );
 
-            scored.into_iter().take(top_k).map(|(score, mut r)| {
-                r.score = score;
-                r
-            }).collect()
+            scored
+                .into_iter()
+                .take(top_k)
+                .map(|(score, mut r)| {
+                    r.score = score;
+                    r
+                })
+                .collect()
         }
         Err(e) => {
             warn!(
@@ -179,7 +181,11 @@ async fn rerank_claude_code(
         .map(|c| c.model.as_str())
         .unwrap_or("haiku");
 
-    debug!("Reranking {} candidates via claude-code SDK (model={})", candidates.len(), model);
+    debug!(
+        "Reranking {} candidates via claude-code SDK (model={})",
+        candidates.len(),
+        model
+    );
 
     let mut options = ClaudeAgentOptions::builder()
         .permission_mode(PermissionMode::BypassPermissions)
@@ -247,7 +253,10 @@ async fn rerank_claude_code(
     }
 
     if skipped_errors > 0 {
-        debug!("Reranking completed with {} skipped parse errors", skipped_errors);
+        debug!(
+            "Reranking completed with {} skipped parse errors",
+            skipped_errors
+        );
     }
 
     parse_scores(&text, candidates.len())
@@ -328,19 +337,16 @@ async fn rerank_anthropic(
                 );
             }
 
-            let body = resp
-                .json::<serde_json::Value>()
-                .await
-                .with_context(|| format!("Failed to parse Anthropic response for candidate {}", i))?;
+            let body = resp.json::<serde_json::Value>().await.with_context(|| {
+                format!("Failed to parse Anthropic response for candidate {}", i)
+            })?;
 
-            let score_text = body["content"][0]["text"]
-                .as_str()
-                .with_context(|| {
-                    format!(
-                        "Anthropic response for candidate {} missing content[0].text: {:?}",
-                        i, body
-                    )
-                })?;
+            let score_text = body["content"][0]["text"].as_str().with_context(|| {
+                format!(
+                    "Anthropic response for candidate {} missing content[0].text: {:?}",
+                    i, body
+                )
+            })?;
 
             let score: f64 = score_text.trim().parse().with_context(|| {
                 format!(
@@ -405,10 +411,7 @@ async fn rerank_ollama(
         .url
         .as_deref()
         .unwrap_or("http://localhost:11434");
-    let model = ollama_config
-        .model
-        .as_deref()
-        .unwrap_or("qwen2.5:1.5b");
+    let model = ollama_config.model.as_deref().unwrap_or("qwen2.5:1.5b");
 
     debug!(
         "Reranking {} candidates via Ollama (url={}, model={})",
@@ -421,7 +424,7 @@ async fn rerank_ollama(
 
     let client = reqwest::Client::new();
     let resp = client
-        .post(&format!("{}/api/generate", url))
+        .post(format!("{}/api/generate", url))
         .json(&serde_json::json!({
             "model": model,
             "prompt": prompt,

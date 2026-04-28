@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub index: IndexConfig,
@@ -186,18 +186,6 @@ impl Default for RerankConfig {
     }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            index: IndexConfig::default(),
-            embeddings: EmbeddingsConfig::default(),
-            search: SearchConfig::default(),
-            watch: WatchConfig::default(),
-            reranking: RerankConfig::default(),
-        }
-    }
-}
-
 impl Default for IndexConfig {
     fn default() -> Self {
         Self {
@@ -237,9 +225,9 @@ impl Default for WatchConfig {
 
 /// Expand ~ to home directory
 pub fn expand_home(path: &str) -> String {
-    if path.starts_with("~/") {
+    if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
-            return home.join(&path[2..]).to_string_lossy().to_string();
+            return home.join(rest).to_string_lossy().to_string();
         }
     }
     path.to_string()
@@ -259,8 +247,11 @@ impl Config {
         }
     }
 
-    /// Get the config file path
+    /// Get the config file path. Honors `RECALL_CONFIG_PATH` for tests/sandboxing.
     pub fn config_path() -> PathBuf {
+        if let Ok(p) = std::env::var("RECALL_CONFIG_PATH") {
+            return PathBuf::from(p);
+        }
         dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("recall")
@@ -279,6 +270,9 @@ impl Config {
 
     /// Check if a path should be excluded from watching
     pub fn should_skip_watch(&self, path: &str) -> bool {
-        self.watch.exclude.iter().any(|pattern| path.contains(pattern))
+        self.watch
+            .exclude
+            .iter()
+            .any(|pattern| path.contains(pattern))
     }
 }

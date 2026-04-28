@@ -22,11 +22,6 @@ struct EmbeddingResponse {
 }
 
 impl Embedder {
-    /// Create a new embedder with default settings
-    pub fn new() -> Self {
-        Self::with_url_and_model("http://localhost:11434", "nomic-embed-text")
-    }
-
     /// Create embedder from Config
     pub fn new_with_config(config: &Config) -> Self {
         Self::with_url_and_model(&config.embeddings.ollama_url, &config.embeddings.model)
@@ -147,4 +142,3 @@ impl Embedder {
         768
     }
 }
-
