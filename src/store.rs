@@ -733,116 +733,30 @@ fn classify_memory_type(file_path: &str) -> Option<String> {
     None
 }
 
-/// Number of overlap characters when splitting at size boundary (~15% of 1600)
-const CHUNK_OVERLAP_CHARS: usize = 240;
-/// Maximum chunk size in characters (~400 tokens)
+/// Maximum chunk size in characters (~400 tokens). Soft cap — chunks split
+/// only at AST block boundaries, never mid-block (code, list, table).
 const MAX_CHUNK_CHARS: usize = 1600;
 
-/// Chunk markdown content into sections with overlap at size boundaries
+/// Chunk markdown content along block boundaries via the AST chunker, then
+/// stamp file-level metadata (date from filename, memory type from path).
 fn chunk_markdown(content: &str, file_path: &str) -> Vec<Chunk> {
-    let mut chunks = Vec::new();
-    let lines: Vec<&str> = content.lines().collect();
-
-    if lines.is_empty() {
-        return chunks;
-    }
-
     let memory_type = classify_memory_type(file_path);
-
-    // Extract date from filename (YYYY-MM-DD.md pattern)
     let date = std::path::Path::new(file_path)
         .file_stem()
         .and_then(|s| s.to_str())
         .filter(|s| s.len() == 10 && s.chars().nth(4) == Some('-') && s.chars().nth(7) == Some('-'))
         .map(|s| s.to_string());
 
-    let mut current_section: Option<String> = None;
-    let mut current_chunk_start = 0;
-    let mut current_chunk_lines: Vec<&str> = Vec::new();
-    // Lines to prepend as overlap from previous size-split chunk
-    let mut overlap_lines: Vec<&str> = Vec::new();
-
-    for (i, line) in lines.iter().enumerate() {
-        // Check for section headers
-        if let Some(header) = line.strip_prefix("## ") {
-            // Save previous chunk if non-empty (no overlap at header boundaries)
-            if !current_chunk_lines.is_empty() {
-                let content = current_chunk_lines.join("\n");
-                if !content.trim().is_empty() {
-                    chunks.push(Chunk {
-                        content,
-                        start_line: (current_chunk_start + 1) as i64,
-                        end_line: i as i64,
-                        date: date.clone(),
-                        section: current_section.clone(),
-                        project: None,
-                        memory_type: memory_type.clone(),
-                    });
-                }
-            }
-
-            // Start new section — clear overlap since header is a semantic boundary
-            current_section = Some(header.trim().to_string());
-            current_chunk_start = i;
-            current_chunk_lines = vec![*line];
-            overlap_lines.clear();
-        } else {
-            current_chunk_lines.push(*line);
-
-            // If chunk is getting too long, split it
-            let chunk_text = current_chunk_lines.join("\n");
-            if chunk_text.len() > MAX_CHUNK_CHARS {
-                let split_lines = &current_chunk_lines[..current_chunk_lines.len() - 1];
-                let content = split_lines.join("\n");
-                if !content.trim().is_empty() {
-                    chunks.push(Chunk {
-                        content,
-                        start_line: (current_chunk_start + 1) as i64,
-                        end_line: i as i64,
-                        date: date.clone(),
-                        section: current_section.clone(),
-                        project: None,
-                        memory_type: memory_type.clone(),
-                    });
-                }
-
-                // Compute overlap: take lines from the end of the emitted chunk
-                // that total ~CHUNK_OVERLAP_CHARS characters
-                overlap_lines.clear();
-                let mut overlap_len = 0;
-                for &ol in split_lines.iter().rev() {
-                    overlap_len += ol.len() + 1; // +1 for newline
-                    overlap_lines.push(ol);
-                    if overlap_len >= CHUNK_OVERLAP_CHARS {
-                        break;
-                    }
-                }
-                overlap_lines.reverse();
-
-                // Start new chunk with overlap + current line
-                current_chunk_start = i.saturating_sub(overlap_lines.len());
-                current_chunk_lines = overlap_lines.clone();
-                current_chunk_lines.push(*line);
-                overlap_lines.clear();
-            }
-        }
-    }
-
-    // Save final chunk
-    if !current_chunk_lines.is_empty() {
-        let content = current_chunk_lines.join("\n");
-        if !content.trim().is_empty() {
-            chunks.push(Chunk {
-                content,
-                start_line: (current_chunk_start + 1) as i64,
-                end_line: lines.len() as i64,
-                date: date.clone(),
-                section: current_section,
-                project: None,
-                memory_type: memory_type.clone(),
-            });
-        }
-    }
-
-    chunks
+    crate::ast::chunk_markdown_ast(content, MAX_CHUNK_CHARS)
+        .into_iter()
+        .map(|raw| Chunk {
+            content: raw.content,
+            start_line: raw.start_line,
+            end_line: raw.end_line,
+            section: raw.section,
+            date: date.clone(),
+            project: None,
+            memory_type: memory_type.clone(),
+        })
+        .collect()
 }

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod ast;
 mod config;
 mod embedder;
 mod mcp;
