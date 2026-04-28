@@ -51,6 +51,10 @@ enum Commands {
         #[arg(long)]
         file: Option<String>,
 
+        /// Restrict to a single collection by name
+        #[arg(long)]
+        collection: Option<String>,
+
         /// Use hybrid search (BM25 + vector)
         #[arg(long)]
         hybrid: bool,
@@ -82,7 +86,7 @@ enum Commands {
 
     /// Index files into the memory database
     Index {
-        /// Path to index (defaults to config paths)
+        /// Path to index (overrides the collection's root_path)
         #[arg(short, long)]
         path: Option<String>,
 
@@ -93,6 +97,17 @@ enum Commands {
         /// Index a single file
         #[arg(long)]
         file: Option<String>,
+
+        /// Collection name. If omitted, indexes every collection at its
+        /// configured root_path.
+        #[arg(long)]
+        collection: Option<String>,
+    },
+
+    /// Manage named collections (one root_path per collection)
+    Collection {
+        #[command(subcommand)]
+        action: CollectionAction,
     },
 
     /// Show index status and statistics
@@ -127,6 +142,29 @@ enum ConfigAction {
     Path,
 }
 
+#[derive(Subcommand)]
+enum CollectionAction {
+    /// Register a new collection rooted at <path>
+    Add {
+        /// Root directory the collection indexes
+        path: String,
+        /// Name for the collection (must be unique)
+        #[arg(long)]
+        name: String,
+    },
+    /// List all collections
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a collection (drops its files, chunks, and embeddings)
+    Remove {
+        /// Name of the collection to remove
+        name: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -144,7 +182,7 @@ async fn main() -> Result<()> {
     if !cli.query.is_empty() {
         let query = cli.query.join(" ");
         return run_search(
-            &config, &query, None, "compact", None, None, None, false, false, None, false,
+            &config, &query, None, "compact", None, None, None, None, false, false, None, false,
         )
         .await;
     }
@@ -157,6 +195,7 @@ async fn main() -> Result<()> {
             after,
             project,
             file,
+            collection,
             hybrid,
             rerank,
             rerank_provider,
@@ -170,6 +209,7 @@ async fn main() -> Result<()> {
                 after,
                 project,
                 file,
+                collection,
                 hybrid,
                 rerank,
                 rerank_provider,
@@ -181,7 +221,9 @@ async fn main() -> Result<()> {
             path,
             incremental,
             file,
-        }) => run_index(&config, path, incremental, file).await,
+            collection,
+        }) => run_index(path, incremental, file, collection).await,
+        Some(Commands::Collection { action }) => run_collection(action),
         Some(Commands::Embed { incremental, limit }) => {
             run_embed(&config, incremental, limit).await
         }
@@ -212,6 +254,7 @@ async fn run_search(
     after: Option<String>,
     project: Option<String>,
     file: Option<String>,
+    collection: Option<String>,
     hybrid: bool,
     rerank: bool,
     rerank_provider: Option<String>,
@@ -221,18 +264,28 @@ async fn run_search(
     let limit = limit.unwrap_or(config.search.default_limit);
     let do_rerank = rerank || config.reranking.enabled;
 
-    // When reranking, fetch more candidates so the reranker has material to work with
+    // Resolve collection name → id (None means search across all collections)
+    let collection_id = match collection.as_deref() {
+        Some(name) => Some(
+            store
+                .get_collection(name)?
+                .ok_or_else(|| anyhow::anyhow!("Collection {:?} not found", name))?
+                .id,
+        ),
+        None => None,
+    };
+
     let fetch_limit = if do_rerank {
         config.reranking.candidates.max(limit)
     } else {
         limit
     };
 
-    // Build search options from filters
     let options = store::SearchOptions {
         after,
         project,
         file_pattern: file,
+        collection_id,
     };
 
     let mut traced: Vec<(store::SearchResult, store::SearchTrace)> = if hybrid {
@@ -244,7 +297,13 @@ async fn run_search(
             store.search_fts_traced(query, fetch_limit, config.search.rrf_k, &options)?
         } else {
             let query_embedding = embedder.embed(query).await?;
-            store.search_hybrid_traced(query, &query_embedding, fetch_limit, config.search.rrf_k)?
+            store.search_hybrid_traced(
+                query,
+                &query_embedding,
+                fetch_limit,
+                config.search.rrf_k,
+                collection_id,
+            )?
         }
     } else {
         store.search_fts_traced(query, fetch_limit, config.search.rrf_k, &options)?
@@ -365,33 +424,68 @@ async fn run_search(
 }
 
 async fn run_index(
-    config: &Config,
     path: Option<String>,
     incremental: bool,
     file: Option<String>,
+    collection: Option<String>,
 ) -> Result<()> {
     let store = store::Store::open()?;
 
+    // Resolve target collections.
+    let targets: Vec<store::Collection> = if let Some(name) = collection.as_deref() {
+        let c = store.get_collection(name)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Collection {:?} not found. Add one with `recall collection add <path> --name <name>`.",
+                name
+            )
+        })?;
+        vec![c]
+    } else if path.is_some() || file.is_some() {
+        anyhow::bail!(
+            "--path / --file require --collection to specify which collection to index into."
+        );
+    } else {
+        let cs = store.list_collections()?;
+        if cs.is_empty() {
+            anyhow::bail!(
+                "No collections registered. Add one with \
+                 `recall collection add <path> --name <name>` and re-run."
+            );
+        }
+        cs
+    };
+
     if let Some(file_path) = file {
-        println!("Indexing single file: {}", file_path);
-        store.index_file(&file_path)?;
+        let target = &targets[0];
+        println!(
+            "Indexing single file into collection {:?}: {}",
+            target.name, file_path
+        );
+        store.index_file(target.id, &file_path)?;
         println!("Done.");
         return Ok(());
     }
 
-    let index_paths = if let Some(p) = path {
-        vec![config::expand_home(&p)]
-    } else {
-        config.index_paths()
-    };
-
-    for index_path in &index_paths {
+    for target in &targets {
+        let index_path = match &path {
+            Some(p) => config::expand_home(p),
+            None => target.root_path.clone(),
+        };
+        if index_path.is_empty() {
+            anyhow::bail!(
+                "Collection {:?} has no root_path; pass --path to index something explicit.",
+                target.name
+            );
+        }
         if incremental {
-            println!("Incremental indexing: {}", index_path);
-            store.index_incremental(index_path)?;
+            println!(
+                "Incremental indexing collection {:?}: {}",
+                target.name, index_path
+            );
+            store.index_incremental(target.id, &index_path)?;
         } else {
-            println!("Full indexing: {}", index_path);
-            store.index_full(index_path)?;
+            println!("Full indexing collection {:?}: {}", target.name, index_path);
+            store.index_full(target.id, &index_path)?;
         }
     }
 
@@ -400,7 +494,44 @@ async fn run_index(
         "Indexed {} files, {} chunks",
         stats.file_count, stats.chunk_count
     );
+    Ok(())
+}
 
+fn run_collection(action: CollectionAction) -> Result<()> {
+    let store = store::Store::open()?;
+    match action {
+        CollectionAction::Add { path, name } => {
+            let abs = config::expand_home(&path);
+            let canon = std::path::Path::new(&abs)
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(&abs))
+                .to_string_lossy()
+                .to_string();
+            let c = store.create_collection(&name, &canon)?;
+            println!("Added collection {:?} → {}", c.name, c.root_path);
+        }
+        CollectionAction::List { json } => {
+            let cs = store.list_collections()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&cs)?);
+            } else if cs.is_empty() {
+                println!(
+                    "No collections. Add one with `recall collection add <path> --name <name>`."
+                );
+            } else {
+                for c in cs {
+                    println!("{:<20} {}", c.name, c.root_path);
+                }
+            }
+        }
+        CollectionAction::Remove { name } => {
+            if store.remove_collection(&name)? {
+                println!("Removed collection {:?}", name);
+            } else {
+                anyhow::bail!("Collection {:?} not found", name);
+            }
+        }
+    }
     Ok(())
 }
 

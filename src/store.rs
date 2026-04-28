@@ -34,6 +34,17 @@ pub struct SearchOptions {
     pub after: Option<String>,
     pub project: Option<String>,
     pub file_pattern: Option<String>,
+    /// Restrict results to a single collection (None = all collections)
+    pub collection_id: Option<i64>,
+}
+
+/// A named collection: a root path that owns a set of indexed files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Collection {
+    pub id: i64,
+    pub name: String,
+    pub root_path: String,
+    pub created_at: i64,
 }
 
 /// Per-result diagnostic info for `--trace`. Fields are populated by whichever
@@ -86,11 +97,52 @@ impl Store {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
         let store = Store { conn, db_path };
+        store.check_schema_compat()?;
         store.init_schema()?;
         store.migrate_embeddings()?;
         store.migrate_memory_type()?;
 
         Ok(store)
+    }
+
+    /// Refuse to operate on a pre-collections DB so we never silently
+    /// double-index or corrupt rows. No fallback by design.
+    fn check_schema_compat(&self) -> Result<()> {
+        let chunks_exists: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='chunks'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !chunks_exists {
+            return Ok(());
+        }
+        let has_col = self
+            .conn
+            .prepare("SELECT collection_id FROM chunks LIMIT 0")
+            .is_ok();
+        if has_col {
+            return Ok(());
+        }
+        let chunk_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
+            .unwrap_or(0);
+        if chunk_count > 0 {
+            anyhow::bail!(
+                "Schema upgrade required (collections support added): existing 'chunks' table \
+                 has {} rows and lacks the collection_id column. Delete {} and re-index. \
+                 No backwards-compat shim by design.",
+                chunk_count,
+                self.db_path.display()
+            );
+        }
+        // Empty old schema — drop so init_schema can recreate with new columns.
+        self.conn
+            .execute_batch("DROP TABLE IF EXISTS chunks; DROP TABLE IF EXISTS files;")?;
+        Ok(())
     }
 
     /// Get the default database path. Honors `RECALL_DB_PATH` for tests/sandboxing.
@@ -111,19 +163,32 @@ impl Store {
     /// Initialize the database schema
     fn init_schema(&self) -> Result<()> {
         self.conn.execute_batch(r#"
+            -- Named collections (root path + metadata). Owns files transitively.
+            CREATE TABLE IF NOT EXISTS collections (
+                id INTEGER PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,
+                root_path TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
             -- Metadata about indexed files
             CREATE TABLE IF NOT EXISTS files (
                 id INTEGER PRIMARY KEY,
-                file_path TEXT UNIQUE NOT NULL,
+                collection_id INTEGER NOT NULL,
+                file_path TEXT NOT NULL,
                 mtime INTEGER NOT NULL,
                 indexed_at INTEGER NOT NULL,
-                chunk_count INTEGER NOT NULL DEFAULT 0
+                chunk_count INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
+                UNIQUE(collection_id, file_path)
             );
 
-            -- Text chunks with metadata
+            -- Text chunks with metadata. collection_id is denormalized from
+            -- files for fast filtering at search time.
             CREATE TABLE IF NOT EXISTS chunks (
                 id INTEGER PRIMARY KEY,
                 file_id INTEGER NOT NULL,
+                collection_id INTEGER NOT NULL,
                 chunk_index INTEGER NOT NULL,
                 date TEXT,
                 section TEXT,
@@ -131,7 +196,8 @@ impl Store {
                 start_line INTEGER NOT NULL,
                 end_line INTEGER NOT NULL,
                 content TEXT NOT NULL,
-                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+                FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+                FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE
             );
 
             -- FTS5 for BM25 search
@@ -163,7 +229,9 @@ impl Store {
 
             -- Create indexes
             CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);
+            CREATE INDEX IF NOT EXISTS idx_chunks_collection_id ON chunks(collection_id);
             CREATE INDEX IF NOT EXISTS idx_chunks_date ON chunks(date);
+            CREATE INDEX IF NOT EXISTS idx_files_collection_id ON files(collection_id);
             CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime);
         "#).context("Failed to initialize schema")?;
 
@@ -351,6 +419,12 @@ impl Store {
             params_vec.push(Box::new(pattern));
         }
 
+        // Add collection filter
+        if let Some(cid) = options.collection_id {
+            sql.push_str(" AND c.collection_id = ?");
+            params_vec.push(Box::new(cid));
+        }
+
         sql.push_str(" ORDER BY score LIMIT ?");
         params_vec.push(Box::new(limit as i64));
 
@@ -383,20 +457,32 @@ impl Store {
     }
 
     /// FTS5 search returning chunk IDs in BM25 rank order (for hybrid search)
-    fn search_fts_chunk_ids(&self, query: &str, limit: usize) -> Result<Vec<i64>> {
-        let mut stmt = self.conn.prepare(
+    fn search_fts_chunk_ids(
+        &self,
+        query: &str,
+        limit: usize,
+        collection_id: Option<i64>,
+    ) -> Result<Vec<i64>> {
+        let mut sql = String::from(
             r#"
             SELECT c.id
             FROM fts_chunks
             JOIN chunks c ON c.id = fts_chunks.rowid
             WHERE fts_chunks MATCH ?1
-            ORDER BY bm25(fts_chunks)
-            LIMIT ?2
         "#,
-        )?;
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(query.to_string()), Box::new(limit as i64)];
+        if let Some(cid) = collection_id {
+            sql.push_str(" AND c.collection_id = ?3");
+            params_vec.push(Box::new(cid));
+        }
+        sql.push_str(" ORDER BY bm25(fts_chunks) LIMIT ?2");
 
-        let rows = stmt.query_map(params![query, limit as i64], |row| row.get::<_, i64>(0))?;
-
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(params_refs.as_slice(), |row| row.get::<_, i64>(0))?;
         let mut ids = Vec::new();
         for row in rows {
             ids.push(row?);
@@ -448,21 +534,68 @@ impl Store {
         Ok((embedded_chunks, total_chunks))
     }
 
-    /// Vector search using sqlite-vec KNN, returning chunk IDs in rank order
-    fn search_vector_chunk_ids(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<i64>> {
+    /// Vector search using sqlite-vec KNN, returning chunk IDs in rank order.
+    /// When `collection_id` is set, runs KNN larger then filters down so the
+    /// final list still contains `limit` items from the requested collection.
+    fn search_vector_chunk_ids(
+        &self,
+        query_embedding: &[f32],
+        limit: usize,
+        collection_id: Option<i64>,
+    ) -> Result<Vec<i64>> {
+        let knn_k = if collection_id.is_some() {
+            limit * 4
+        } else {
+            limit
+        };
         let mut stmt = self
             .conn
             .prepare("SELECT rowid FROM vec_embeddings WHERE embedding MATCH ?1 AND k = ?2")?;
-
-        let rows = stmt.query_map(params![query_embedding.as_bytes(), limit as i64], |row| {
+        let rows = stmt.query_map(params![query_embedding.as_bytes(), knn_k as i64], |row| {
             row.get::<_, i64>(0)
         })?;
-
-        let mut ids = Vec::new();
+        let mut ids: Vec<i64> = Vec::new();
         for row in rows {
             ids.push(row?);
         }
-        Ok(ids)
+
+        if let Some(cid) = collection_id {
+            // Filter to the requested collection without losing rank order.
+            let mut filtered = Vec::with_capacity(limit);
+            let placeholders = (0..ids.len())
+                .map(|i| format!("?{}", i + 2))
+                .collect::<Vec<_>>()
+                .join(",");
+            if ids.is_empty() {
+                return Ok(filtered);
+            }
+            let sql = format!(
+                "SELECT id FROM chunks WHERE collection_id = ?1 AND id IN ({})",
+                placeholders
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(cid)];
+            for id in &ids {
+                params_vec.push(Box::new(*id));
+            }
+            let params_refs: Vec<&dyn rusqlite::ToSql> =
+                params_vec.iter().map(|p| p.as_ref()).collect();
+            let allowed: std::collections::HashSet<i64> = stmt
+                .query_map(params_refs.as_slice(), |row| row.get::<_, i64>(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+            for id in ids {
+                if allowed.contains(&id) {
+                    filtered.push(id);
+                    if filtered.len() == limit {
+                        break;
+                    }
+                }
+            }
+            Ok(filtered)
+        } else {
+            Ok(ids)
+        }
     }
 
     /// Hybrid search combining BM25 and vector search using Reciprocal Rank Fusion
@@ -472,9 +605,10 @@ impl Store {
         query_embedding: &[f32],
         limit: usize,
         rrf_k: u32,
+        collection_id: Option<i64>,
     ) -> Result<Vec<SearchResult>> {
         Ok(self
-            .search_hybrid_traced(query, query_embedding, limit, rrf_k)?
+            .search_hybrid_traced(query, query_embedding, limit, rrf_k, collection_id)?
             .into_iter()
             .map(|(r, _t)| r)
             .collect())
@@ -488,12 +622,14 @@ impl Store {
         query_embedding: &[f32],
         limit: usize,
         rrf_k: u32,
+        collection_id: Option<i64>,
     ) -> Result<Vec<(SearchResult, SearchTrace)>> {
         let candidate_count = limit * 3;
         let k = rrf_k as f64;
 
-        let bm25_ranked = self.search_fts_chunk_ids(query, candidate_count)?;
-        let vector_ranked = self.search_vector_chunk_ids(query_embedding, candidate_count)?;
+        let bm25_ranked = self.search_fts_chunk_ids(query, candidate_count, collection_id)?;
+        let vector_ranked =
+            self.search_vector_chunk_ids(query_embedding, candidate_count, collection_id)?;
 
         let bm25_idx: HashMap<i64, usize> = bm25_ranked
             .iter()
@@ -591,14 +727,18 @@ impl Store {
         }
     }
 
-    /// Delete vec_embeddings for chunks belonging to a file
-    fn delete_embeddings_for_file(&self, file_path: &str) -> Result<()> {
-        // Get chunk IDs for this file
+    /// Delete vec_embeddings for chunks belonging to a (collection, file) pair.
+    /// Same physical file path can exist in multiple collections; we only
+    /// drop embeddings for the one being re-indexed.
+    fn delete_embeddings_for_file(&self, collection_id: i64, file_path: &str) -> Result<()> {
         let mut stmt = self.conn.prepare(
-            "SELECT c.id FROM chunks c JOIN files f ON f.id = c.file_id WHERE f.file_path = ?1",
+            "SELECT c.id FROM chunks c JOIN files f ON f.id = c.file_id \
+             WHERE f.collection_id = ?1 AND f.file_path = ?2",
         )?;
         let chunk_ids: Vec<i64> = stmt
-            .query_map(params![file_path], |row| row.get::<_, i64>(0))?
+            .query_map(params![collection_id, file_path], |row| {
+                row.get::<_, i64>(0)
+            })?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -608,13 +748,13 @@ impl Store {
                     "DELETE FROM vec_embeddings WHERE rowid = ?1",
                     params![chunk_id],
                 )
-                .ok(); // Ignore errors for missing rows
+                .ok();
         }
         Ok(())
     }
 
-    /// Index a single file
-    pub fn index_file(&self, file_path: &str) -> Result<()> {
+    /// Index a single file into the given collection.
+    pub fn index_file(&self, collection_id: i64, file_path: &str) -> Result<()> {
         let path = std::path::Path::new(file_path);
         if !path.exists() {
             anyhow::bail!("File does not exist: {}", file_path);
@@ -629,20 +769,20 @@ impl Store {
         let content = std::fs::read_to_string(path)?;
         let chunks = chunk_markdown(&content, file_path);
 
-        // Clean up vec_embeddings before deleting chunks (no CASCADE for virtual tables)
-        self.delete_embeddings_for_file(file_path)?;
+        self.delete_embeddings_for_file(collection_id, file_path)?;
 
-        // Begin transaction
         self.conn.execute("BEGIN", [])?;
 
-        // Delete existing file entry if exists (CASCADE deletes chunks and FTS)
-        self.conn
-            .execute("DELETE FROM files WHERE file_path = ?1", params![file_path])?;
-
-        // Insert file record
         self.conn.execute(
-            "INSERT INTO files (file_path, mtime, indexed_at, chunk_count) VALUES (?1, ?2, ?3, ?4)",
+            "DELETE FROM files WHERE collection_id = ?1 AND file_path = ?2",
+            params![collection_id, file_path],
+        )?;
+
+        self.conn.execute(
+            "INSERT INTO files (collection_id, file_path, mtime, indexed_at, chunk_count) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
+                collection_id,
                 file_path,
                 mtime,
                 Utc::now().timestamp(),
@@ -652,13 +792,13 @@ impl Store {
 
         let file_id = self.conn.last_insert_rowid();
 
-        // Insert chunks
         for (i, chunk) in chunks.iter().enumerate() {
             self.conn.execute(
-                r#"INSERT INTO chunks (file_id, chunk_index, date, section, project, start_line, end_line, content, memory_type)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+                r#"INSERT INTO chunks (file_id, collection_id, chunk_index, date, section, project, start_line, end_line, content, memory_type)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
                 params![
                     file_id,
+                    collection_id,
                     i as i64,
                     chunk.date,
                     chunk.section,
@@ -672,28 +812,36 @@ impl Store {
         }
 
         self.conn.execute("COMMIT", [])?;
-
         Ok(())
     }
 
-    /// Full index of a directory
-    pub fn index_full(&self, dir_path: &str) -> Result<()> {
-        // Clear vec_embeddings first (no CASCADE)
-        self.conn.execute("DELETE FROM vec_embeddings", [])?;
-        // Clear chunks and files
-        self.conn.execute("DELETE FROM chunks", [])?;
-        self.conn.execute("DELETE FROM files", [])?;
-
-        self.index_directory(dir_path)
+    /// Full re-index of a directory into a collection (drops all of that
+    /// collection's existing rows first, then walks the tree).
+    pub fn index_full(&self, collection_id: i64, dir_path: &str) -> Result<()> {
+        // Drop embeddings for chunks in this collection
+        self.conn.execute(
+            "DELETE FROM vec_embeddings WHERE rowid IN \
+             (SELECT id FROM chunks WHERE collection_id = ?1)",
+            params![collection_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM chunks WHERE collection_id = ?1",
+            params![collection_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM files WHERE collection_id = ?1",
+            params![collection_id],
+        )?;
+        self.index_directory(collection_id, dir_path)
     }
 
-    /// Incremental index (only changed files)
-    pub fn index_incremental(&self, dir_path: &str) -> Result<()> {
-        self.index_directory(dir_path)
+    /// Incremental index (only changed files) into the given collection.
+    pub fn index_incremental(&self, collection_id: i64, dir_path: &str) -> Result<()> {
+        self.index_directory(collection_id, dir_path)
     }
 
-    /// Index all markdown files in a directory
-    fn index_directory(&self, dir_path: &str) -> Result<()> {
+    /// Index all markdown files in a directory into a collection
+    fn index_directory(&self, collection_id: i64, dir_path: &str) -> Result<()> {
         let pattern = format!("{}/**/*.md", dir_path);
         let exclude_patterns = [
             "**/Templates/**",
@@ -706,18 +854,15 @@ impl Store {
             let path = entry?;
             let path_str = path.to_string_lossy().to_string();
 
-            // Skip excluded patterns
             let should_skip = exclude_patterns.iter().any(|pattern| {
                 glob::Pattern::new(pattern)
                     .map(|p| p.matches(&path_str))
                     .unwrap_or(false)
             });
-
             if should_skip {
                 continue;
             }
 
-            // Check if file needs re-indexing
             let metadata = std::fs::metadata(&path)?;
             let mtime = metadata
                 .modified()?
@@ -727,21 +872,114 @@ impl Store {
             let needs_index = self
                 .conn
                 .query_row(
-                    "SELECT mtime FROM files WHERE file_path = ?1",
-                    params![&path_str],
+                    "SELECT mtime FROM files WHERE collection_id = ?1 AND file_path = ?2",
+                    params![collection_id, &path_str],
                     |row| row.get::<_, i64>(0),
                 )
                 .map(|stored_mtime| stored_mtime < mtime)
                 .unwrap_or(true);
 
             if needs_index {
-                if let Err(e) = self.index_file(&path_str) {
+                if let Err(e) = self.index_file(collection_id, &path_str) {
                     eprintln!("Warning: Failed to index {}: {}", path_str, e);
                 }
             }
         }
 
         Ok(())
+    }
+
+    // ── Collection CRUD ───────────────────────────────────────────────────
+
+    pub fn create_collection(&self, name: &str, root_path: &str) -> Result<Collection> {
+        let now = Utc::now().timestamp();
+        self.conn.execute(
+            "INSERT INTO collections (name, root_path, created_at) VALUES (?1, ?2, ?3)",
+            params![name, root_path, now],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        Ok(Collection {
+            id,
+            name: name.to_string(),
+            root_path: root_path.to_string(),
+            created_at: now,
+        })
+    }
+
+    pub fn list_collections(&self) -> Result<Vec<Collection>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, root_path, created_at FROM collections ORDER BY name")?;
+        let rows = stmt.query_map([], |row| {
+            Ok(Collection {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                root_path: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn get_collection(&self, name: &str) -> Result<Option<Collection>> {
+        let result = self.conn.query_row(
+            "SELECT id, name, root_path, created_at FROM collections WHERE name = ?1",
+            params![name],
+            |row| {
+                Ok(Collection {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    root_path: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            },
+        );
+        match result {
+            Ok(c) => Ok(Some(c)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Remove a collection by name. Cascades to files and chunks; also drops
+    /// embeddings (vec0 has no FK CASCADE).
+    pub fn remove_collection(&self, name: &str) -> Result<bool> {
+        let cid = match self.get_collection(name)? {
+            Some(c) => c.id,
+            None => return Ok(false),
+        };
+        self.conn.execute(
+            "DELETE FROM vec_embeddings WHERE rowid IN \
+             (SELECT id FROM chunks WHERE collection_id = ?1)",
+            params![cid],
+        )?;
+        self.conn
+            .execute("DELETE FROM collections WHERE id = ?1", params![cid])?;
+        Ok(true)
+    }
+
+    /// Best-effort collection lookup by file path: returns the collection
+    /// whose `root_path` is a prefix of `file_path`. Used by the watcher.
+    pub fn collection_for_path(&self, file_path: &str) -> Result<Option<Collection>> {
+        let collections = self.list_collections()?;
+        // Pick the longest matching root_path (most specific).
+        let mut best: Option<Collection> = None;
+        for c in collections {
+            if !c.root_path.is_empty()
+                && file_path.starts_with(&c.root_path)
+                && best
+                    .as_ref()
+                    .map(|b| c.root_path.len() > b.root_path.len())
+                    .unwrap_or(true)
+            {
+                best = Some(c);
+            }
+        }
+        Ok(best)
     }
 }
 
