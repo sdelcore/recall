@@ -123,6 +123,12 @@ enum Commands {
         action: ContextAction,
     },
 
+    /// Database maintenance: integrity checks, VACUUM, FTS rebuild
+    Maintenance {
+        #[command(subcommand)]
+        action: Option<MaintenanceAction>,
+    },
+
     /// Show index status and statistics
     Status {
         /// Output as JSON
@@ -153,6 +159,20 @@ enum ConfigAction {
     Show,
     /// Show config file path
     Path,
+}
+
+#[derive(Subcommand)]
+enum MaintenanceAction {
+    /// Read-only integrity checks: PRAGMA integrity_check + orphan counts
+    Check {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// VACUUM the database (reclaims space after deletes)
+    Vacuum,
+    /// Drop and rebuild the FTS5 index from chunks
+    RebuildFts,
 }
 
 #[derive(Subcommand)]
@@ -263,6 +283,7 @@ async fn main() -> Result<()> {
         }) => run_index(path, incremental, file, collection).await,
         Some(Commands::Collection { action }) => run_collection(action),
         Some(Commands::Context { action }) => run_context(action),
+        Some(Commands::Maintenance { action }) => run_maintenance(action),
         Some(Commands::Embed { incremental, limit }) => {
             run_embed(&config, incremental, limit).await
         }
@@ -643,6 +664,64 @@ fn run_context(action: ContextAction) -> Result<()> {
                 anyhow::bail!("Collection {:?} not found", collection);
             }
             println!("Cleared description for {:?}", collection);
+        }
+    }
+    Ok(())
+}
+
+fn run_maintenance(action: Option<MaintenanceAction>) -> Result<()> {
+    let store = store::Store::open()?;
+    match action.unwrap_or(MaintenanceAction::Check { json: false }) {
+        MaintenanceAction::Check { json } => {
+            let integrity = store.integrity_check()?;
+            let orphans = store.orphan_counts()?;
+            let stats = store.get_stats()?;
+            let healthy = integrity == "ok"
+                && orphans.chunks == 0
+                && orphans.files == 0
+                && orphans.embeddings == 0;
+            if json {
+                let out = serde_json::json!({
+                    "integrity": integrity,
+                    "orphans": {
+                        "chunks": orphans.chunks,
+                        "files": orphans.files,
+                        "embeddings": orphans.embeddings,
+                    },
+                    "files": stats.file_count,
+                    "chunks": stats.chunk_count,
+                    "healthy": healthy,
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                println!("Recall Maintenance");
+                println!("==================");
+                println!("Integrity:           {}", integrity);
+                println!("Orphan chunks:       {}", orphans.chunks);
+                println!("Orphan files:        {}", orphans.files);
+                println!("Orphan embeddings:   {}", orphans.embeddings);
+                println!("Files:               {}", stats.file_count);
+                println!("Chunks:              {}", stats.chunk_count);
+                println!(
+                    "Status:              {}",
+                    if healthy {
+                        "healthy"
+                    } else {
+                        "needs attention"
+                    }
+                );
+            }
+            if !healthy {
+                anyhow::bail!("DB needs attention (see counts above)");
+            }
+        }
+        MaintenanceAction::Vacuum => {
+            store.vacuum()?;
+            println!("VACUUM complete.");
+        }
+        MaintenanceAction::RebuildFts => {
+            store.rebuild_fts()?;
+            println!("FTS5 index rebuilt.");
         }
     }
     Ok(())
