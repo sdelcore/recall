@@ -137,7 +137,10 @@ async fn main() -> Result<()> {
     // Handle direct query (no subcommand)
     if !cli.query.is_empty() {
         let query = cli.query.join(" ");
-        return run_search(&config, &query, None, "compact", None, None, None, false, false, None).await;
+        return run_search(
+            &config, &query, None, "compact", None, None, None, false, false, None,
+        )
+        .await;
     }
 
     match cli.command {
@@ -152,27 +155,31 @@ async fn main() -> Result<()> {
             rerank,
             rerank_provider,
         }) => {
-            run_search(&config, &query, limit, &format, after, project, file, hybrid, rerank, rerank_provider).await
+            run_search(
+                &config,
+                &query,
+                limit,
+                &format,
+                after,
+                project,
+                file,
+                hybrid,
+                rerank,
+                rerank_provider,
+            )
+            .await
         }
         Some(Commands::Index {
             path,
             incremental,
             file,
-        }) => {
-            run_index(&config, path, incremental, file).await
-        }
+        }) => run_index(&config, path, incremental, file).await,
         Some(Commands::Embed { incremental, limit }) => {
             run_embed(&config, incremental, limit).await
         }
-        Some(Commands::Status { json }) => {
-            run_status(json).await
-        }
-        Some(Commands::Watch) => {
-            run_watch(&config)
-        }
-        Some(Commands::Config { action }) => {
-            run_config(&config, action)
-        }
+        Some(Commands::Status { json }) => run_status(json).await,
+        Some(Commands::Watch) => run_watch(&config),
+        Some(Commands::Config { action }) => run_config(&config, action),
         Some(Commands::Serve { mode }) => {
             if mode != "mcp" {
                 anyhow::bail!("Unknown serve mode: {}. Only 'mcp' is supported.", mode);
@@ -188,6 +195,7 @@ async fn main() -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_search(
     config: &Config,
     query: &str,
@@ -281,8 +289,14 @@ async fn run_search(
         "full" => {
             println!("Found {} results for \"{}\":\n", results.len(), query);
             for (i, result) in results.iter().enumerate() {
-                println!("[{}] {}:{}-{} (score: {:.2})",
-                    i + 1, result.file_path, result.start_line, result.end_line, result.score);
+                println!(
+                    "[{}] {}:{}-{} (score: {:.2})",
+                    i + 1,
+                    result.file_path,
+                    result.start_line,
+                    result.end_line,
+                    result.score
+                );
                 if let Some(section) = &result.section {
                     println!("Section: {}", section);
                 }
@@ -293,8 +307,14 @@ async fn run_search(
             // Compact format (default)
             println!("Found {} results for \"{}\":\n", results.len(), query);
             for (i, result) in results.iter().enumerate() {
-                println!("[{}] {}:{}-{} (score: {:.2})",
-                    i + 1, result.file_path, result.start_line, result.end_line, result.score);
+                println!(
+                    "[{}] {}:{}-{} (score: {:.2})",
+                    i + 1,
+                    result.file_path,
+                    result.start_line,
+                    result.end_line,
+                    result.score
+                );
                 // Truncate content for compact display
                 let snippet: String = result.content.chars().take(200).collect();
                 let snippet = if result.content.len() > 200 {
@@ -310,7 +330,12 @@ async fn run_search(
     Ok(())
 }
 
-async fn run_index(config: &Config, path: Option<String>, incremental: bool, file: Option<String>) -> Result<()> {
+async fn run_index(
+    config: &Config,
+    path: Option<String>,
+    incremental: bool,
+    file: Option<String>,
+) -> Result<()> {
     let store = store::Store::open()?;
 
     if let Some(file_path) = file {
@@ -337,7 +362,10 @@ async fn run_index(config: &Config, path: Option<String>, incremental: bool, fil
     }
 
     let stats = store.get_stats()?;
-    println!("Indexed {} files, {} chunks", stats.file_count, stats.chunk_count);
+    println!(
+        "Indexed {} files, {} chunks",
+        stats.file_count, stats.chunk_count
+    );
 
     Ok(())
 }
@@ -371,9 +399,15 @@ async fn run_status(json: bool) -> Result<()> {
         println!();
         println!("Files indexed: {}", stats.file_count);
         println!("Chunks stored: {}", stats.chunk_count);
-        println!("Embeddings: {}/{} ({:.1}%)",
-            embedded, stats.chunk_count,
-            if stats.chunk_count > 0 { (embedded as f64 / stats.chunk_count as f64) * 100.0 } else { 0.0 }
+        println!(
+            "Embeddings: {}/{} ({:.1}%)",
+            embedded,
+            stats.chunk_count,
+            if stats.chunk_count > 0 {
+                (embedded as f64 / stats.chunk_count as f64) * 100.0
+            } else {
+                0.0
+            }
         );
         if let Some(last) = stats.last_indexed {
             println!("Last indexed: {}", last);
@@ -424,9 +458,15 @@ async fn run_embed(config: &Config, incremental: bool, limit: Option<usize>) -> 
     let embedder = embedder::Embedder::new_with_config(config);
 
     // Check Ollama connectivity
-    println!("Checking Ollama connectivity at {}...", config.embeddings.ollama_url);
+    println!(
+        "Checking Ollama connectivity at {}...",
+        config.embeddings.ollama_url
+    );
     if !embedder.health_check().await? {
-        anyhow::bail!("Cannot connect to Ollama at {}. Is it running?", config.embeddings.ollama_url);
+        anyhow::bail!(
+            "Cannot connect to Ollama at {}. Is it running?",
+            config.embeddings.ollama_url
+        );
     }
     println!("Ollama is available.");
 
@@ -452,7 +492,10 @@ async fn run_embed(config: &Config, incremental: bool, limit: Option<usize>) -> 
         return Ok(());
     }
 
-    println!("Generating embeddings for {} chunks using {}...\n", total, config.embeddings.model);
+    println!(
+        "Generating embeddings for {} chunks using {}...\n",
+        total, config.embeddings.model
+    );
 
     let mut success_count = 0;
     let mut error_count = 0;
@@ -472,7 +515,10 @@ async fn run_embed(config: &Config, incremental: bool, limit: Option<usize>) -> 
                 }
             }
             Err(e) => {
-                eprintln!("\nFailed to generate embedding for chunk {}: {}", chunk_id, e);
+                eprintln!(
+                    "\nFailed to generate embedding for chunk {}: {}",
+                    chunk_id, e
+                );
                 error_count += 1;
             }
         }
@@ -485,8 +531,10 @@ async fn run_embed(config: &Config, incremental: bool, limit: Option<usize>) -> 
     }
 
     let (embedded, total_chunks) = store.get_embedding_stats()?;
-    println!("  Total embedded: {}/{} chunks ({:.1}%)",
-        embedded, total_chunks,
+    println!(
+        "  Total embedded: {}/{} chunks ({:.1}%)",
+        embedded,
+        total_chunks,
         (embedded as f64 / total_chunks as f64) * 100.0
     );
 

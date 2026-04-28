@@ -44,13 +44,17 @@ pub struct Store {
 
 /// Register sqlite-vec extension (must be called before opening any connection)
 fn register_sqlite_vec() {
+    use rusqlite::ffi::{sqlite3, sqlite3_api_routines};
+    type AutoExtension = unsafe extern "C" fn(
+        *mut sqlite3,
+        *mut *mut std::os::raw::c_char,
+        *const sqlite3_api_routines,
+    ) -> std::os::raw::c_int;
     static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        unsafe {
-            sqlite3_auto_extension(Some(std::mem::transmute(
-                sqlite_vec::sqlite3_vec_init as *const (),
-            )));
-        }
+    INIT.call_once(|| unsafe {
+        sqlite3_auto_extension(Some(std::mem::transmute::<*const (), AutoExtension>(
+            sqlite_vec::sqlite3_vec_init as *const (),
+        )));
     });
 }
 
@@ -63,12 +67,10 @@ impl Store {
 
         // Ensure parent directory exists
         if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .context("Failed to create data directory")?;
+            std::fs::create_dir_all(parent).context("Failed to create data directory")?;
         }
 
-        let conn = Connection::open(&db_path)
-            .context("Failed to open database")?;
+        let conn = Connection::open(&db_path).context("Failed to open database")?;
 
         // Enable foreign keys for CASCADE to work
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -81,10 +83,13 @@ impl Store {
         Ok(store)
     }
 
-    /// Get the default database path
+    /// Get the default database path. Honors `RECALL_DB_PATH` for tests/sandboxing.
     fn default_path() -> Result<PathBuf> {
-        let data_dir = dirs::data_local_dir()
-            .context("Could not determine local data directory")?;
+        if let Ok(p) = std::env::var("RECALL_DB_PATH") {
+            return Ok(PathBuf::from(p));
+        }
+        let data_dir =
+            dirs::data_local_dir().context("Could not determine local data directory")?;
         Ok(data_dir.join("recall").join("memory.sqlite"))
     }
 
@@ -162,9 +167,11 @@ impl Store {
         ).unwrap_or(false);
 
         if !has_vec_table {
-            self.conn.execute_batch(
-                "CREATE VIRTUAL TABLE vec_embeddings USING vec0(embedding float[768]);"
-            ).context("Failed to create vec_embeddings table")?;
+            self.conn
+                .execute_batch(
+                    "CREATE VIRTUAL TABLE vec_embeddings USING vec0(embedding float[768]);",
+                )
+                .context("Failed to create vec_embeddings table")?;
         }
 
         Ok(())
@@ -172,42 +179,56 @@ impl Store {
 
     /// Migrate from old BLOB-based embeddings table to vec0
     fn migrate_embeddings(&self) -> Result<()> {
-        let has_old_table: bool = self.conn.query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='embeddings'",
-            [],
-            |row| row.get(0),
-        ).unwrap_or(false);
+        let has_old_table: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='embeddings'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
 
         if !has_old_table {
             return Ok(());
         }
 
-        let old_count: i64 = self.conn
+        let old_count: i64 = self
+            .conn
             .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
             .unwrap_or(0);
 
         if old_count == 0 {
-            self.conn.execute_batch("DROP TABLE IF EXISTS embeddings;")?;
+            self.conn
+                .execute_batch("DROP TABLE IF EXISTS embeddings;")?;
             return Ok(());
         }
 
-        eprintln!("Migrating {} embeddings from BLOB to sqlite-vec format...", old_count);
+        eprintln!(
+            "Migrating {} embeddings from BLOB to sqlite-vec format...",
+            old_count
+        );
 
-        let mut stmt = self.conn.prepare(
-            "SELECT chunk_id, embedding FROM embeddings"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT chunk_id, embedding FROM embeddings")?;
 
-        let rows: Vec<(i64, Vec<u8>)> = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?.filter_map(|r| r.ok()).collect();
+        let rows: Vec<(i64, Vec<u8>)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         for (chunk_id, bytes) in &rows {
             // Check if this chunk still exists (may have been orphaned)
-            let chunk_exists: bool = self.conn.query_row(
-                "SELECT COUNT(*) > 0 FROM chunks WHERE id = ?1",
-                params![chunk_id],
-                |row| row.get(0),
-            ).unwrap_or(false);
+            let chunk_exists: bool = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM chunks WHERE id = ?1",
+                    params![chunk_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
 
             if !chunk_exists {
                 continue;
@@ -228,15 +249,15 @@ impl Store {
 
     /// Add memory_type column if not present
     fn migrate_memory_type(&self) -> Result<()> {
-        let has_col: bool = self.conn
+        let has_col: bool = self
+            .conn
             .prepare("SELECT memory_type FROM chunks LIMIT 0")
             .is_ok();
         if !has_col {
+            self.conn
+                .execute_batch("ALTER TABLE chunks ADD COLUMN memory_type TEXT;")?;
             self.conn.execute_batch(
-                "ALTER TABLE chunks ADD COLUMN memory_type TEXT;"
-            )?;
-            self.conn.execute_batch(
-                "CREATE INDEX IF NOT EXISTS idx_chunks_memory_type ON chunks(memory_type);"
+                "CREATE INDEX IF NOT EXISTS idx_chunks_memory_type ON chunks(memory_type);",
             )?;
         }
         Ok(())
@@ -244,15 +265,18 @@ impl Store {
 
     /// Get store statistics
     pub fn get_stats(&self) -> Result<StoreStats> {
-        let file_count: i64 = self.conn
+        let file_count: i64 = self
+            .conn
             .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
             .unwrap_or(0);
 
-        let chunk_count: i64 = self.conn
+        let chunk_count: i64 = self
+            .conn
             .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
             .unwrap_or(0);
 
-        let last_indexed: Option<String> = self.conn
+        let last_indexed: Option<String> = self
+            .conn
             .query_row(
                 "SELECT datetime(MAX(indexed_at), 'unixepoch') FROM files",
                 [],
@@ -275,7 +299,8 @@ impl Store {
         options: &SearchOptions,
     ) -> Result<Vec<SearchResult>> {
         // Build dynamic query with filters
-        let mut sql = String::from(r#"
+        let mut sql = String::from(
+            r#"
             SELECT
                 f.file_path,
                 c.start_line,
@@ -290,7 +315,8 @@ impl Store {
             JOIN chunks c ON c.id = fts_chunks.rowid
             JOIN files f ON f.id = c.file_id
             WHERE fts_chunks MATCH ?
-        "#);
+        "#,
+        );
 
         // Build parameter list dynamically
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(query.to_string())];
@@ -321,7 +347,8 @@ impl Store {
         let mut stmt = self.conn.prepare(&sql)?;
 
         // Convert params to references for rusqlite
-        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
 
         let results = stmt.query_map(params_refs.as_slice(), |row| {
             Ok(SearchResult {
@@ -347,18 +374,18 @@ impl Store {
 
     /// FTS5 search returning chunk IDs in BM25 rank order (for hybrid search)
     fn search_fts_chunk_ids(&self, query: &str, limit: usize) -> Result<Vec<i64>> {
-        let mut stmt = self.conn.prepare(r#"
+        let mut stmt = self.conn.prepare(
+            r#"
             SELECT c.id
             FROM fts_chunks
             JOIN chunks c ON c.id = fts_chunks.rowid
             WHERE fts_chunks MATCH ?1
             ORDER BY bm25(fts_chunks)
             LIMIT ?2
-        "#)?;
+        "#,
+        )?;
 
-        let rows = stmt.query_map(params![query, limit as i64], |row| {
-            row.get::<_, i64>(0)
-        })?;
+        let rows = stmt.query_map(params![query, limit as i64], |row| row.get::<_, i64>(0))?;
 
         let mut ids = Vec::new();
         for row in rows {
@@ -398,11 +425,13 @@ impl Store {
 
     /// Get embedding statistics
     pub fn get_embedding_stats(&self) -> Result<(i64, i64)> {
-        let total_chunks: i64 = self.conn
+        let total_chunks: i64 = self
+            .conn
             .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
             .unwrap_or(0);
 
-        let embedded_chunks: i64 = self.conn
+        let embedded_chunks: i64 = self
+            .conn
             .query_row("SELECT COUNT(*) FROM vec_embeddings", [], |row| row.get(0))
             .unwrap_or(0);
 
@@ -410,19 +439,14 @@ impl Store {
     }
 
     /// Vector search using sqlite-vec KNN, returning chunk IDs in rank order
-    fn search_vector_chunk_ids(
-        &self,
-        query_embedding: &[f32],
-        limit: usize,
-    ) -> Result<Vec<i64>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT rowid FROM vec_embeddings WHERE embedding MATCH ?1 AND k = ?2"
-        )?;
+    fn search_vector_chunk_ids(&self, query_embedding: &[f32], limit: usize) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT rowid FROM vec_embeddings WHERE embedding MATCH ?1 AND k = ?2")?;
 
-        let rows = stmt.query_map(
-            params![query_embedding.as_bytes(), limit as i64],
-            |row| row.get::<_, i64>(0),
-        )?;
+        let rows = stmt.query_map(params![query_embedding.as_bytes(), limit as i64], |row| {
+            row.get::<_, i64>(0)
+        })?;
 
         let mut ids = Vec::new();
         for row in rows {
@@ -508,17 +532,20 @@ impl Store {
     fn delete_embeddings_for_file(&self, file_path: &str) -> Result<()> {
         // Get chunk IDs for this file
         let mut stmt = self.conn.prepare(
-            "SELECT c.id FROM chunks c JOIN files f ON f.id = c.file_id WHERE f.file_path = ?1"
+            "SELECT c.id FROM chunks c JOIN files f ON f.id = c.file_id WHERE f.file_path = ?1",
         )?;
-        let chunk_ids: Vec<i64> = stmt.query_map(params![file_path], |row| {
-            row.get::<_, i64>(0)
-        })?.filter_map(|r| r.ok()).collect();
+        let chunk_ids: Vec<i64> = stmt
+            .query_map(params![file_path], |row| row.get::<_, i64>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
 
         for chunk_id in chunk_ids {
-            self.conn.execute(
-                "DELETE FROM vec_embeddings WHERE rowid = ?1",
-                params![chunk_id],
-            ).ok(); // Ignore errors for missing rows
+            self.conn
+                .execute(
+                    "DELETE FROM vec_embeddings WHERE rowid = ?1",
+                    params![chunk_id],
+                )
+                .ok(); // Ignore errors for missing rows
         }
         Ok(())
     }
@@ -531,7 +558,8 @@ impl Store {
         }
 
         let metadata = std::fs::metadata(path)?;
-        let mtime = metadata.modified()?
+        let mtime = metadata
+            .modified()?
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs() as i64;
 
@@ -545,12 +573,18 @@ impl Store {
         self.conn.execute("BEGIN", [])?;
 
         // Delete existing file entry if exists (CASCADE deletes chunks and FTS)
-        self.conn.execute("DELETE FROM files WHERE file_path = ?1", params![file_path])?;
+        self.conn
+            .execute("DELETE FROM files WHERE file_path = ?1", params![file_path])?;
 
         // Insert file record
         self.conn.execute(
             "INSERT INTO files (file_path, mtime, indexed_at, chunk_count) VALUES (?1, ?2, ?3, ?4)",
-            params![file_path, mtime, Utc::now().timestamp(), chunks.len() as i64],
+            params![
+                file_path,
+                mtime,
+                Utc::now().timestamp(),
+                chunks.len() as i64
+            ],
         )?;
 
         let file_id = self.conn.last_insert_rowid();
@@ -622,11 +656,13 @@ impl Store {
 
             // Check if file needs re-indexing
             let metadata = std::fs::metadata(&path)?;
-            let mtime = metadata.modified()?
+            let mtime = metadata
+                .modified()?
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs() as i64;
 
-            let needs_index = self.conn
+            let needs_index = self
+                .conn
                 .query_row(
                     "SELECT mtime FROM files WHERE file_path = ?1",
                     params![&path_str],
@@ -728,7 +764,7 @@ fn chunk_markdown(content: &str, file_path: &str) -> Vec<Chunk> {
 
     for (i, line) in lines.iter().enumerate() {
         // Check for section headers
-        if line.starts_with("## ") {
+        if let Some(header) = line.strip_prefix("## ") {
             // Save previous chunk if non-empty (no overlap at header boundaries)
             if !current_chunk_lines.is_empty() {
                 let content = current_chunk_lines.join("\n");
@@ -746,7 +782,7 @@ fn chunk_markdown(content: &str, file_path: &str) -> Vec<Chunk> {
             }
 
             // Start new section — clear overlap since header is a semantic boundary
-            current_section = Some(line[3..].trim().to_string());
+            current_section = Some(header.trim().to_string());
             current_chunk_start = i;
             current_chunk_lines = vec![*line];
             overlap_lines.clear();
