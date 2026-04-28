@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 mod ast;
 mod config;
 mod embedder;
+mod intent;
 mod mcp;
 mod reranker;
 mod store;
@@ -71,6 +72,12 @@ enum Commands {
         /// reranker score). Forces JSON output.
         #[arg(long)]
         trace: bool,
+
+        /// Auto-route search params from heuristic intent classification:
+        /// exploratory queries enable hybrid + rerank; temporal queries set
+        /// `--after` from the extracted year.
+        #[arg(long)]
+        auto: bool,
     },
 
     /// Generate embeddings for indexed chunks
@@ -211,6 +218,7 @@ async fn main() -> Result<()> {
         let query = cli.query.join(" ");
         return run_search(
             &config, &query, None, "compact", None, None, None, None, false, false, None, false,
+            false,
         )
         .await;
     }
@@ -228,6 +236,7 @@ async fn main() -> Result<()> {
             rerank,
             rerank_provider,
             trace,
+            auto,
         }) => {
             run_search(
                 &config,
@@ -242,6 +251,7 @@ async fn main() -> Result<()> {
                 rerank,
                 rerank_provider,
                 trace,
+                auto,
             )
             .await
         }
@@ -284,14 +294,36 @@ async fn run_search(
     project: Option<String>,
     file: Option<String>,
     collection: Option<String>,
-    hybrid: bool,
+    mut hybrid: bool,
     rerank: bool,
     rerank_provider: Option<String>,
     trace: bool,
+    auto: bool,
 ) -> Result<()> {
     let store = store::Store::open()?;
     let limit = limit.unwrap_or(config.search.default_limit);
-    let do_rerank = rerank || config.reranking.enabled;
+    let mut do_rerank = rerank || config.reranking.enabled;
+
+    // Heuristic intent classification (always computed; surfaced in trace).
+    let classified = intent::classify(query);
+
+    // --auto routes params from intent unless the user already overrode them
+    // explicitly on the CLI.
+    let mut after = after;
+    if auto {
+        match classified.intent {
+            intent::Intent::Exploratory => {
+                hybrid = true;
+                do_rerank = true;
+            }
+            intent::Intent::Temporal => {
+                if let (None, Some(year)) = (after.as_deref(), classified.year) {
+                    after = Some(format!("{year}-01-01"));
+                }
+            }
+            intent::Intent::Lookup | intent::Intent::Structural => {}
+        }
+    }
 
     // Resolve collection name → id (None means search across all collections)
     let collection_id = match collection.as_deref() {
@@ -385,6 +417,10 @@ async fn run_search(
         "json" => {
             let output = serde_json::json!({
                 "query": query,
+                "intent": {
+                    "kind": classified.intent.as_str(),
+                    "year": classified.year,
+                },
                 "results": traced.iter().map(|(r, t)| {
                     let mut obj = serde_json::json!({
                         "file": r.file_path,

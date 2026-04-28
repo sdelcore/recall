@@ -80,6 +80,47 @@ fn search_with_no_index_returns_empty_results() {
 }
 
 #[test]
+fn search_emits_intent_classification() {
+    let sandbox = RecallSandbox::new();
+    let vault = tempdir().unwrap();
+    write_fixture_vault(vault.path());
+    add_and_index(&sandbox, vault.path(), "test");
+
+    // Short specific term — lookup
+    sandbox
+        .cmd()
+        .args(["search", "Paxos", "--format", "json"])
+        .assert()
+        .success()
+        .stdout(predicate::function(|out: &str| {
+            let v: serde_json::Value = serde_json::from_str(out).unwrap();
+            v["intent"]["kind"] == "lookup"
+        }));
+
+    // Question form — exploratory
+    sandbox
+        .cmd()
+        .args(["search", "how does Paxos work?", "--format", "json"])
+        .assert()
+        .success()
+        .stdout(predicate::function(|out: &str| {
+            let v: serde_json::Value = serde_json::from_str(out).unwrap();
+            v["intent"]["kind"] == "exploratory"
+        }));
+
+    // Year reference — temporal with extracted year
+    sandbox
+        .cmd()
+        .args(["search", "Paxos in 2025", "--format", "json"])
+        .assert()
+        .success()
+        .stdout(predicate::function(|out: &str| {
+            let v: serde_json::Value = serde_json::from_str(out).unwrap();
+            v["intent"]["kind"] == "temporal" && v["intent"]["year"].as_i64() == Some(2025)
+        }));
+}
+
+#[test]
 fn search_with_trace_emits_trace_object() {
     let sandbox = RecallSandbox::new();
     let vault = tempdir().unwrap();

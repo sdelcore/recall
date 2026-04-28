@@ -293,7 +293,9 @@ impl Store {
         })
     }
 
-    /// Search using FTS5 (BM25) with filters
+    /// Search using FTS5 (BM25) with filters. The query is sanitized first
+    /// (see [`sanitize_fts_query`]) so callers can pass natural language
+    /// without worrying about FTS5 operator syntax.
     pub fn search_fts_filtered(
         &self,
         query: &str,
@@ -324,7 +326,8 @@ impl Store {
         );
 
         // Build parameter list dynamically
-        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(query.to_string())];
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(sanitize_fts_query(query))];
 
         // Add date filter
         if let Some(after) = &options.after {
@@ -401,7 +404,7 @@ impl Store {
         "#,
         );
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
-            vec![Box::new(query.to_string()), Box::new(limit as i64)];
+            vec![Box::new(sanitize_fts_query(query)), Box::new(limit as i64)];
         if let Some(cid) = collection_id {
             sql.push_str(" AND c.collection_id = ?3");
             params_vec.push(Box::new(cid));
@@ -948,6 +951,25 @@ struct Chunk {
 
 /// Classify a file into a memory type based on its path.
 /// Returns: "semantic", "procedural", "episodic", "skill", or None for general content.
+/// Sanitize a free-text query into something FTS5 will accept as a MATCH
+/// expression. Drops FTS5 operators (`?`, `:`, `"`, parentheses, etc.) so
+/// natural-language queries from users / classifiers don't blow up with
+/// `fts5: syntax error`. Tokens are rejoined with spaces — FTS5 treats
+/// multiple unquoted tokens as an implicit AND-of-OR over its tokenizer.
+fn sanitize_fts_query(query: &str) -> String {
+    let cleaned: String = query
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c.is_whitespace() {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn classify_memory_type(file_path: &str) -> Option<String> {
     let path_lower = file_path.to_lowercase();
 
