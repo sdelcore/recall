@@ -168,12 +168,7 @@ fn context_description_appears_in_search_results() {
 
     sandbox
         .cmd()
-        .args([
-            "context",
-            "add",
-            "notes",
-            "Personal notes and stray ideas",
-        ])
+        .args(["context", "add", "notes", "Personal notes and stray ideas"])
         .assert()
         .success();
 
