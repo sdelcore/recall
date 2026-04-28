@@ -110,6 +110,12 @@ enum Commands {
         action: CollectionAction,
     },
 
+    /// Manage per-collection descriptions returned alongside search hits
+    Context {
+        #[command(subcommand)]
+        action: ContextAction,
+    },
+
     /// Show index status and statistics
     Status {
         /// Output as JSON
@@ -140,6 +146,28 @@ enum ConfigAction {
     Show,
     /// Show config file path
     Path,
+}
+
+#[derive(Subcommand)]
+enum ContextAction {
+    /// Set or replace the description for a collection
+    Add {
+        /// Collection name
+        collection: String,
+        /// Description text returned alongside search results from this collection
+        description: String,
+    },
+    /// List all collections and their descriptions
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Clear the description for a collection
+    Remove {
+        /// Collection name
+        collection: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -224,6 +252,7 @@ async fn main() -> Result<()> {
             collection,
         }) => run_index(path, incremental, file, collection).await,
         Some(Commands::Collection { action }) => run_collection(action),
+        Some(Commands::Context { action }) => run_context(action),
         Some(Commands::Embed { incremental, limit }) => {
             run_embed(&config, incremental, limit).await
         }
@@ -365,6 +394,10 @@ async fn run_search(
                         "date": r.date,
                         "section": r.section,
                         "memory_type": r.memory_type,
+                        "collection": {
+                            "name": r.collection_name,
+                            "description": r.collection_description,
+                        },
                     });
                     if trace_active {
                         obj["trace"] = serde_json::json!({
@@ -530,6 +563,50 @@ fn run_collection(action: CollectionAction) -> Result<()> {
             } else {
                 anyhow::bail!("Collection {:?} not found", name);
             }
+        }
+    }
+    Ok(())
+}
+
+fn run_context(action: ContextAction) -> Result<()> {
+    let store = store::Store::open()?;
+    match action {
+        ContextAction::Add {
+            collection,
+            description,
+        } => {
+            if !store.set_collection_description(&collection, Some(&description))? {
+                anyhow::bail!("Collection {:?} not found", collection);
+            }
+            println!("Set description for {:?}", collection);
+        }
+        ContextAction::List { json } => {
+            let cs = store.list_collections()?;
+            if json {
+                let payload: Vec<serde_json::Value> = cs
+                    .into_iter()
+                    .map(|c| {
+                        serde_json::json!({
+                            "name": c.name,
+                            "description": c.description,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&payload)?);
+            } else if cs.is_empty() {
+                println!("No collections.");
+            } else {
+                for c in cs {
+                    let d = c.description.as_deref().unwrap_or("(no description)");
+                    println!("{:<20} {}", c.name, d);
+                }
+            }
+        }
+        ContextAction::Remove { collection } => {
+            if !store.set_collection_description(&collection, None)? {
+                anyhow::bail!("Collection {:?} not found", collection);
+            }
+            println!("Cleared description for {:?}", collection);
         }
     }
     Ok(())

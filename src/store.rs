@@ -18,6 +18,12 @@ pub struct SearchResult {
     pub section: Option<String>,
     pub project: Option<String>,
     pub memory_type: Option<String>,
+    /// Name of the collection that owns this chunk (None when constructed
+    /// outside of a DB query, e.g. in a reranker test).
+    pub collection_name: Option<String>,
+    /// Description of that collection, if any. Threaded through so callers
+    /// can show source context (qmd-style "context tree") with each hit.
+    pub collection_description: Option<String>,
 }
 
 /// Statistics about the memory store
@@ -39,11 +45,14 @@ pub struct SearchOptions {
 }
 
 /// A named collection: a root path that owns a set of indexed files.
+/// `description` is the human-readable context string returned alongside
+/// search hits so an LLM knows which source the chunk came from.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Collection {
     pub id: i64,
     pub name: String,
     pub root_path: String,
+    pub description: Option<String>,
     pub created_at: i64,
 }
 
@@ -99,8 +108,6 @@ impl Store {
         let store = Store { conn, db_path };
         store.check_schema_compat()?;
         store.init_schema()?;
-        store.migrate_embeddings()?;
-        store.migrate_memory_type()?;
 
         Ok(store)
     }
@@ -168,6 +175,7 @@ impl Store {
                 id INTEGER PRIMARY KEY,
                 name TEXT UNIQUE NOT NULL,
                 root_path TEXT NOT NULL,
+                description TEXT,
                 created_at INTEGER NOT NULL
             );
 
@@ -193,6 +201,7 @@ impl Store {
                 date TEXT,
                 section TEXT,
                 project TEXT,
+                memory_type TEXT,
                 start_line INTEGER NOT NULL,
                 end_line INTEGER NOT NULL,
                 content TEXT NOT NULL,
@@ -231,6 +240,7 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);
             CREATE INDEX IF NOT EXISTS idx_chunks_collection_id ON chunks(collection_id);
             CREATE INDEX IF NOT EXISTS idx_chunks_date ON chunks(date);
+            CREATE INDEX IF NOT EXISTS idx_chunks_memory_type ON chunks(memory_type);
             CREATE INDEX IF NOT EXISTS idx_files_collection_id ON files(collection_id);
             CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime);
         "#).context("Failed to initialize schema")?;
@@ -252,92 +262,6 @@ impl Store {
                 .context("Failed to create vec_embeddings table")?;
         }
 
-        Ok(())
-    }
-
-    /// Migrate from old BLOB-based embeddings table to vec0
-    fn migrate_embeddings(&self) -> Result<()> {
-        let has_old_table: bool = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='embeddings'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-
-        if !has_old_table {
-            return Ok(());
-        }
-
-        let old_count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
-            .unwrap_or(0);
-
-        if old_count == 0 {
-            self.conn
-                .execute_batch("DROP TABLE IF EXISTS embeddings;")?;
-            return Ok(());
-        }
-
-        eprintln!(
-            "Migrating {} embeddings from BLOB to sqlite-vec format...",
-            old_count
-        );
-
-        let mut stmt = self
-            .conn
-            .prepare("SELECT chunk_id, embedding FROM embeddings")?;
-
-        let rows: Vec<(i64, Vec<u8>)> = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        for (chunk_id, bytes) in &rows {
-            // Check if this chunk still exists (may have been orphaned)
-            let chunk_exists: bool = self
-                .conn
-                .query_row(
-                    "SELECT COUNT(*) > 0 FROM chunks WHERE id = ?1",
-                    params![chunk_id],
-                    |row| row.get(0),
-                )
-                .unwrap_or(false);
-
-            if !chunk_exists {
-                continue;
-            }
-
-            // The old format is already le bytes of f32, which is what vec0 expects
-            self.conn.execute(
-                "INSERT OR REPLACE INTO vec_embeddings(rowid, embedding) VALUES (?1, ?2)",
-                params![chunk_id, bytes],
-            )?;
-        }
-
-        self.conn.execute_batch("DROP TABLE embeddings;")?;
-        eprintln!("Migration complete.");
-
-        Ok(())
-    }
-
-    /// Add memory_type column if not present
-    fn migrate_memory_type(&self) -> Result<()> {
-        let has_col: bool = self
-            .conn
-            .prepare("SELECT memory_type FROM chunks LIMIT 0")
-            .is_ok();
-        if !has_col {
-            self.conn
-                .execute_batch("ALTER TABLE chunks ADD COLUMN memory_type TEXT;")?;
-            self.conn.execute_batch(
-                "CREATE INDEX IF NOT EXISTS idx_chunks_memory_type ON chunks(memory_type);",
-            )?;
-        }
         Ok(())
     }
 
@@ -388,10 +312,13 @@ impl Store {
                 c.date,
                 c.section,
                 c.project,
-                c.memory_type
+                c.memory_type,
+                col.name,
+                col.description
             FROM fts_chunks
             JOIN chunks c ON c.id = fts_chunks.rowid
             JOIN files f ON f.id = c.file_id
+            JOIN collections col ON col.id = c.collection_id
             WHERE fts_chunks MATCH ?
         "#,
         );
@@ -445,6 +372,8 @@ impl Store {
                 section: row.get(6)?,
                 project: row.get(7)?,
                 memory_type: row.get(8)?,
+                collection_name: row.get(9)?,
+                collection_description: row.get(10)?,
             })
         })?;
 
@@ -700,9 +629,12 @@ impl Store {
     /// Get chunk by ID with score
     fn get_chunk_by_id(&self, chunk_id: i64, score: f64) -> Result<Option<SearchResult>> {
         let result = self.conn.query_row(
-            r#"SELECT f.file_path, c.start_line, c.end_line, c.content, c.date, c.section, c.project, c.memory_type
+            r#"SELECT f.file_path, c.start_line, c.end_line, c.content,
+                      c.date, c.section, c.project, c.memory_type,
+                      col.name, col.description
                FROM chunks c
                JOIN files f ON f.id = c.file_id
+               JOIN collections col ON col.id = c.collection_id
                WHERE c.id = ?1"#,
             params![chunk_id],
             |row| {
@@ -716,6 +648,8 @@ impl Store {
                     section: row.get(5)?,
                     project: row.get(6)?,
                     memory_type: row.get(7)?,
+                    collection_name: row.get(8)?,
+                    collection_description: row.get(9)?,
                 })
             },
         );
@@ -902,20 +836,22 @@ impl Store {
             id,
             name: name.to_string(),
             root_path: root_path.to_string(),
+            description: None,
             created_at: now,
         })
     }
 
     pub fn list_collections(&self) -> Result<Vec<Collection>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, name, root_path, created_at FROM collections ORDER BY name")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, root_path, description, created_at FROM collections ORDER BY name",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok(Collection {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 root_path: row.get(2)?,
-                created_at: row.get(3)?,
+                description: row.get(3)?,
+                created_at: row.get(4)?,
             })
         })?;
         let mut out = Vec::new();
@@ -927,14 +863,15 @@ impl Store {
 
     pub fn get_collection(&self, name: &str) -> Result<Option<Collection>> {
         let result = self.conn.query_row(
-            "SELECT id, name, root_path, created_at FROM collections WHERE name = ?1",
+            "SELECT id, name, root_path, description, created_at FROM collections WHERE name = ?1",
             params![name],
             |row| {
                 Ok(Collection {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     root_path: row.get(2)?,
-                    created_at: row.get(3)?,
+                    description: row.get(3)?,
+                    created_at: row.get(4)?,
                 })
             },
         );
@@ -943,6 +880,20 @@ impl Store {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Set or clear a collection's description. Returns false if no
+    /// collection by that name exists.
+    pub fn set_collection_description(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE collections SET description = ?1 WHERE name = ?2",
+            params![description, name],
+        )?;
+        Ok(n > 0)
     }
 
     /// Remove a collection by name. Cascades to files and chunks; also drops

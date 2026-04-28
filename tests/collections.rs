@@ -153,6 +153,87 @@ fn index_without_any_collections_fails() {
 }
 
 #[test]
+fn context_description_appears_in_search_results() {
+    let sandbox = RecallSandbox::new();
+    let vault = tempdir().unwrap();
+    write_fixture_vault(vault.path());
+
+    sandbox
+        .cmd()
+        .args(["collection", "add"])
+        .arg(vault.path())
+        .args(["--name", "notes"])
+        .assert()
+        .success();
+
+    sandbox
+        .cmd()
+        .args([
+            "context",
+            "add",
+            "notes",
+            "Personal notes and stray ideas",
+        ])
+        .assert()
+        .success();
+
+    sandbox
+        .cmd()
+        .args(["index", "--collection", "notes"])
+        .assert()
+        .success();
+
+    sandbox
+        .cmd()
+        .args(["search", "Paxos", "--format", "json"])
+        .assert()
+        .success()
+        .stdout(predicate::function(|out: &str| {
+            let v: serde_json::Value = serde_json::from_str(out).unwrap();
+            let r = &v["results"][0];
+            r["collection"]["name"] == "notes"
+                && r["collection"]["description"] == "Personal notes and stray ideas"
+        }));
+}
+
+#[test]
+fn context_remove_clears_description() {
+    let sandbox = RecallSandbox::new();
+    let vault = tempdir().unwrap();
+    write_fixture_vault(vault.path());
+
+    sandbox
+        .cmd()
+        .args(["collection", "add"])
+        .arg(vault.path())
+        .args(["--name", "notes"])
+        .assert()
+        .success();
+
+    sandbox
+        .cmd()
+        .args(["context", "add", "notes", "first description"])
+        .assert()
+        .success();
+
+    sandbox
+        .cmd()
+        .args(["context", "remove", "notes"])
+        .assert()
+        .success();
+
+    sandbox
+        .cmd()
+        .args(["context", "list", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::function(|out: &str| {
+            let v: serde_json::Value = serde_json::from_str(out).unwrap();
+            v[0]["description"].is_null()
+        }));
+}
+
+#[test]
 fn search_with_unknown_collection_fails() {
     let sandbox = RecallSandbox::new();
     sandbox
