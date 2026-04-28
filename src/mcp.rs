@@ -127,6 +127,10 @@ fn handle_tools_list(id: &Option<Value>) -> Value {
                             "after": {
                                 "type": "string",
                                 "description": "Only include results after this date (YYYY-MM-DD)"
+                            },
+                            "collection": {
+                                "type": "string",
+                                "description": "Restrict to a single collection by name (default: all collections)"
                             }
                         },
                         "required": ["query"]
@@ -134,13 +138,17 @@ fn handle_tools_list(id: &Option<Value>) -> Value {
                 },
                 {
                     "name": "recall_index",
-                    "description": "Trigger incremental re-indexing of the Obsidian vault. Only re-indexes files that have changed since last index.",
+                    "description": "Trigger incremental re-indexing. With no args, indexes every collection at its root_path.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
+                            "collection": {
+                                "type": "string",
+                                "description": "Index just this collection (by name)"
+                            },
                             "path": {
                                 "type": "string",
-                                "description": "Specific path to index (defaults to configured index paths)"
+                                "description": "Override the collection's root_path (requires 'collection')"
                             }
                         }
                     }
@@ -199,8 +207,19 @@ async fn tool_search(args: &Value, config: &Config) -> Result<String> {
     let hybrid = args["hybrid"].as_bool().unwrap_or(true);
     let do_rerank = args["rerank"].as_bool().unwrap_or(false);
     let after = args["after"].as_str().map(|s| s.to_string());
+    let collection = args["collection"].as_str();
 
     let store = Store::open()?;
+
+    let collection_id = match collection {
+        Some(name) => Some(
+            store
+                .get_collection(name)?
+                .ok_or_else(|| anyhow::anyhow!("Collection {:?} not found", name))?
+                .id,
+        ),
+        None => None,
+    };
 
     let fetch_limit = if do_rerank {
         config.reranking.candidates.max(limit)
@@ -212,6 +231,7 @@ async fn tool_search(args: &Value, config: &Config) -> Result<String> {
         after,
         project: None,
         file_pattern: None,
+        collection_id,
     };
 
     let mut results = if hybrid {
@@ -221,7 +241,13 @@ async fn tool_search(args: &Value, config: &Config) -> Result<String> {
             store.search_fts_filtered(query, fetch_limit, &options)?
         } else {
             let query_embedding = embedder.embed(query).await?;
-            store.search_hybrid(query, &query_embedding, fetch_limit, config.search.rrf_k)?
+            store.search_hybrid(
+                query,
+                &query_embedding,
+                fetch_limit,
+                config.search.rrf_k,
+                collection_id,
+            )?
         }
     } else {
         store.search_fts_filtered(query, fetch_limit, &options)?
@@ -254,25 +280,45 @@ async fn tool_search(args: &Value, config: &Config) -> Result<String> {
     serde_json::to_string_pretty(&output).context("Failed to serialize search results")
 }
 
-async fn tool_index(args: &Value, config: &Config) -> Result<String> {
+async fn tool_index(args: &Value, _config: &Config) -> Result<String> {
     let store = Store::open()?;
+    let collection = args["collection"].as_str();
+    let path_arg = args["path"].as_str();
 
-    let paths = if let Some(path) = args["path"].as_str() {
-        vec![crate::config::expand_home(path)]
+    let targets = if let Some(name) = collection {
+        let c = store
+            .get_collection(name)?
+            .ok_or_else(|| anyhow::anyhow!("Collection {:?} not found", name))?;
+        vec![c]
+    } else if path_arg.is_some() {
+        anyhow::bail!("'path' requires 'collection' to specify which collection to index into.");
     } else {
-        config.index_paths()
+        let cs = store.list_collections()?;
+        if cs.is_empty() {
+            anyhow::bail!(
+                "No collections registered. Add one with `recall collection add` and re-run."
+            );
+        }
+        cs
     };
 
-    for path in &paths {
-        store.index_incremental(path)?;
+    let mut count = 0usize;
+    for target in &targets {
+        let dir = match path_arg {
+            Some(p) => crate::config::expand_home(p),
+            None => target.root_path.clone(),
+        };
+        if dir.is_empty() {
+            continue;
+        }
+        store.index_incremental(target.id, &dir)?;
+        count += 1;
     }
 
     let stats = store.get_stats()?;
     Ok(format!(
-        "Indexed {} files, {} chunks across {} paths",
-        stats.file_count,
-        stats.chunk_count,
-        paths.len()
+        "Indexed {} files, {} chunks across {} collection(s)",
+        stats.file_count, stats.chunk_count, count
     ))
 }
 

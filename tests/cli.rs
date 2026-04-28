@@ -8,19 +8,29 @@ use common::{write_fixture_vault, RecallSandbox};
 use predicates::prelude::*;
 use tempfile::tempdir;
 
+/// Register a collection and seed it with the fixture vault.
+fn add_and_index(sandbox: &RecallSandbox, vault: &std::path::Path, name: &str) {
+    sandbox
+        .cmd()
+        .args(["collection", "add"])
+        .arg(vault)
+        .args(["--name", name])
+        .assert()
+        .success();
+
+    sandbox
+        .cmd()
+        .args(["index", "--collection", name])
+        .assert()
+        .success();
+}
+
 #[test]
 fn index_then_bm25_search_returns_expected_hit() {
     let sandbox = RecallSandbox::new();
     let vault = tempdir().unwrap();
     write_fixture_vault(vault.path());
-
-    sandbox
-        .cmd()
-        .args(["index", "--path"])
-        .arg(vault.path())
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Indexed").and(predicate::str::contains("chunks")));
+    add_and_index(&sandbox, vault.path(), "test");
 
     // Term unique to gamma.md
     sandbox
@@ -44,13 +54,7 @@ fn status_json_reports_indexed_counts() {
     let sandbox = RecallSandbox::new();
     let vault = tempdir().unwrap();
     write_fixture_vault(vault.path());
-
-    sandbox
-        .cmd()
-        .args(["index", "--path"])
-        .arg(vault.path())
-        .assert()
-        .success();
+    add_and_index(&sandbox, vault.path(), "test");
 
     sandbox
         .cmd()
@@ -80,13 +84,7 @@ fn search_with_trace_emits_trace_object() {
     let sandbox = RecallSandbox::new();
     let vault = tempdir().unwrap();
     write_fixture_vault(vault.path());
-
-    sandbox
-        .cmd()
-        .args(["index", "--path"])
-        .arg(vault.path())
-        .assert()
-        .success();
+    add_and_index(&sandbox, vault.path(), "test");
 
     sandbox
         .cmd()
