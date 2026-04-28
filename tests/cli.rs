@@ -74,3 +74,34 @@ fn search_with_no_index_returns_empty_results() {
         .success()
         .stdout(predicate::str::contains("\"results\""));
 }
+
+#[test]
+fn search_with_trace_emits_trace_object() {
+    let sandbox = RecallSandbox::new();
+    let vault = tempdir().unwrap();
+    write_fixture_vault(vault.path());
+
+    sandbox
+        .cmd()
+        .args(["index", "--path"])
+        .arg(vault.path())
+        .assert()
+        .success();
+
+    sandbox
+        .cmd()
+        .args(["search", "Paxos", "--trace"])
+        .assert()
+        .success()
+        .stdout(predicate::function(|out: &str| {
+            let v: serde_json::Value = serde_json::from_str(out).unwrap();
+            let r = &v["results"][0];
+            // gamma.md has the only Paxos hit
+            r["file"].as_str().unwrap().contains("gamma.md")
+                // BM25-only path: bm25_rank=0, vec_rank=null, rrf_score>0, rerank_score=null
+                && r["trace"]["bm25_rank"].as_i64() == Some(0)
+                && r["trace"]["vec_rank"].is_null()
+                && r["trace"]["rrf_score"].as_f64().unwrap() > 0.0
+                && r["trace"]["rerank_score"].is_null()
+        }));
+}

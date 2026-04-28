@@ -62,6 +62,11 @@ enum Commands {
         /// Override reranking provider (claude-code, anthropic, ollama)
         #[arg(long)]
         rerank_provider: Option<String>,
+
+        /// Emit per-result diagnostic info (BM25 rank, vec rank, RRF score,
+        /// reranker score). Forces JSON output.
+        #[arg(long)]
+        trace: bool,
     },
 
     /// Generate embeddings for indexed chunks
@@ -139,7 +144,7 @@ async fn main() -> Result<()> {
     if !cli.query.is_empty() {
         let query = cli.query.join(" ");
         return run_search(
-            &config, &query, None, "compact", None, None, None, false, false, None,
+            &config, &query, None, "compact", None, None, None, false, false, None, false,
         )
         .await;
     }
@@ -155,6 +160,7 @@ async fn main() -> Result<()> {
             hybrid,
             rerank,
             rerank_provider,
+            trace,
         }) => {
             run_search(
                 &config,
@@ -167,6 +173,7 @@ async fn main() -> Result<()> {
                 hybrid,
                 rerank,
                 rerank_provider,
+                trace,
             )
             .await
         }
@@ -208,6 +215,7 @@ async fn run_search(
     hybrid: bool,
     rerank: bool,
     rerank_provider: Option<String>,
+    trace: bool,
 ) -> Result<()> {
     let store = store::Store::open()?;
     let limit = limit.unwrap_or(config.search.default_limit);
@@ -227,54 +235,70 @@ async fn run_search(
         file_pattern: file,
     };
 
-    let mut results = if hybrid {
-        // Hybrid search with embeddings
+    let mut traced: Vec<(store::SearchResult, store::SearchTrace)> = if hybrid {
         let embedder = embedder::Embedder::new_with_config(config);
-
-        // Check if embeddings are available
         let (embedded, _) = store.get_embedding_stats()?;
         if embedded == 0 {
             eprintln!("Warning: No embeddings found. Run 'recall embed' first.");
             eprintln!("Falling back to BM25 search.\n");
-            store.search_fts_filtered(query, fetch_limit, &options)?
+            store.search_fts_traced(query, fetch_limit, config.search.rrf_k, &options)?
         } else {
-            // Generate query embedding
             let query_embedding = embedder.embed(query).await?;
-
-            store.search_hybrid(query, &query_embedding, fetch_limit, config.search.rrf_k)?
+            store.search_hybrid_traced(query, &query_embedding, fetch_limit, config.search.rrf_k)?
         }
     } else {
-        // BM25 only
-        store.search_fts_filtered(query, fetch_limit, &options)?
+        store.search_fts_traced(query, fetch_limit, config.search.rrf_k, &options)?
     };
 
     // LLM reranking
-    if do_rerank && !results.is_empty() {
+    if do_rerank && !traced.is_empty() {
         let mut rerank_config = config.reranking.clone();
-        // Override provider if specified on CLI
         if let Some(provider) = rerank_provider {
             rerank_config.provider = provider;
         }
-        // Ensure top_k respects the user's requested limit
         rerank_config.top_k = limit;
 
         eprintln!(
             "Reranking {} candidates via {} (top {})...",
-            results.len(),
+            traced.len(),
             rerank_config.provider,
             rerank_config.top_k,
         );
-        results = reranker::rerank(query, results, &rerank_config).await;
+
+        // Snapshot pre-rerank traces by chunk identity so we can re-pair
+        // after the reranker reorders + truncates.
+        let mut trace_by_key: std::collections::HashMap<(String, i64, i64), store::SearchTrace> =
+            std::collections::HashMap::new();
+        for (r, t) in &traced {
+            trace_by_key.insert((r.file_path.clone(), r.start_line, r.end_line), t.clone());
+        }
+
+        let plain: Vec<store::SearchResult> = traced.into_iter().map(|(r, _)| r).collect();
+        let reranked = reranker::rerank(query, plain, &rerank_config).await;
+
+        traced = reranked
+            .into_iter()
+            .map(|r| {
+                let key = (r.file_path.clone(), r.start_line, r.end_line);
+                let mut t = trace_by_key.remove(&key).unwrap_or_default();
+                t.rerank_score = Some(r.score);
+                (r, t)
+            })
+            .collect();
     } else if !do_rerank {
-        results.truncate(limit);
+        traced.truncate(limit);
     }
+
+    let results: Vec<&store::SearchResult> = traced.iter().map(|(r, _)| r).collect();
+    let trace_active = trace;
+    let format = if trace_active { "json" } else { format };
 
     match format {
         "json" => {
             let output = serde_json::json!({
                 "query": query,
-                "results": results.iter().map(|r| {
-                    serde_json::json!({
+                "results": traced.iter().map(|(r, t)| {
+                    let mut obj = serde_json::json!({
                         "file": r.file_path,
                         "lines": format!("{}-{}", r.start_line, r.end_line),
                         "score": r.score,
@@ -282,7 +306,16 @@ async fn run_search(
                         "date": r.date,
                         "section": r.section,
                         "memory_type": r.memory_type,
-                    })
+                    });
+                    if trace_active {
+                        obj["trace"] = serde_json::json!({
+                            "bm25_rank": t.bm25_rank,
+                            "vec_rank": t.vec_rank,
+                            "rrf_score": t.rrf_score,
+                            "rerank_score": t.rerank_score,
+                        });
+                    }
+                    obj
                 }).collect::<Vec<_>>()
             });
             println!("{}", serde_json::to_string_pretty(&output)?);
