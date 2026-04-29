@@ -277,14 +277,21 @@ impl Store {
             .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
             .unwrap_or(0);
 
+        // Emit RFC3339 with explicit UTC offset (`...Z`) so consumers can render
+        // in their own timezone instead of guessing whether the naive string is
+        // local or UTC. SQLite's `datetime(..., 'unixepoch')` returns a naive
+        // string; we format the unix timestamp directly via chrono instead.
         let last_indexed: Option<String> = self
             .conn
             .query_row(
-                "SELECT datetime(MAX(indexed_at), 'unixepoch') FROM files",
+                "SELECT MAX(indexed_at) FROM files",
                 [],
-                |row| row.get(0),
+                |row| row.get::<_, Option<i64>>(0),
             )
-            .ok();
+            .ok()
+            .flatten()
+            .and_then(|ts| chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0))
+            .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
 
         Ok(StoreStats {
             file_count,
