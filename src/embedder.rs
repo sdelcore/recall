@@ -67,19 +67,6 @@ impl Embedder {
         Ok(result.embedding)
     }
 
-    /// Generate embeddings for multiple texts (batched)
-    #[allow(dead_code)]
-    pub async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let mut embeddings = Vec::with_capacity(texts.len());
-
-        for text in texts {
-            let embedding = self.embed(text).await?;
-            embeddings.push(embedding);
-        }
-
-        Ok(embeddings)
-    }
-
     /// Check if Ollama is available
     pub async fn health_check(&self) -> Result<bool> {
         let url = format!("{}/api/tags", self.base_url);
@@ -133,12 +120,5 @@ impl Embedder {
 
         eprintln!("Model '{}' pulled successfully.", self.model);
         Ok(())
-    }
-
-    /// Get embedding dimensions for the configured model
-    #[allow(dead_code)]
-    pub fn dimensions(&self) -> usize {
-        // nomic-embed-text produces 768-dimensional embeddings
-        768
     }
 }

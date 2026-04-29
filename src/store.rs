@@ -283,11 +283,9 @@ impl Store {
         // string; we format the unix timestamp directly via chrono instead.
         let last_indexed: Option<String> = self
             .conn
-            .query_row(
-                "SELECT MAX(indexed_at) FROM files",
-                [],
-                |row| row.get::<_, Option<i64>>(0),
-            )
+            .query_row("SELECT MAX(indexed_at) FROM files", [], |row| {
+                row.get::<_, Option<i64>>(0)
+            })
             .ok()
             .flatten()
             .and_then(|ts| chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0))
