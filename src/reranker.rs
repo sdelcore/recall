@@ -1,11 +1,11 @@
 //! LLM-based reranking for search results.
 //!
-//! Three concrete adapters satisfy the [`Reranker`] trait:
-//! - [`ClaudeCodeReranker`]: claude-agent-sdk (default, no API key needed)
-//! - [`AnthropicReranker`]: direct Anthropic Messages API (parallel calls, needs key)
-//! - [`OllamaReranker`]: local Ollama model (offline fallback)
+//! Three concrete adapters satisfy the `Reranker` trait:
+//! `ClaudeCodeReranker` (claude-agent-sdk, default, no API key),
+//! `AnthropicReranker` (direct Messages API, parallel calls, needs key),
+//! and `OllamaReranker` (local model, offline fallback).
 //!
-//! [`rerank`] is the orchestration entry point: it constructs the adapter from
+//! `rerank` is the orchestration entry point: it constructs the adapter from
 //! config, calls `score`, validates the result, sorts, and falls back to RRF
 //! order on any failure. The trait is the test seam — orchestration is covered
 //! by unit tests against a fake adapter.
@@ -313,10 +313,9 @@ pub struct AnthropicReranker {
 
 impl AnthropicReranker {
     fn from_config(config: &RerankConfig) -> Result<Self> {
-        let api_config = config
-            .anthropic
-            .as_ref()
-            .context("Reranking provider is 'anthropic' but [reranking.anthropic] config is missing")?;
+        let api_config = config.anthropic.as_ref().context(
+            "Reranking provider is 'anthropic' but [reranking.anthropic] config is missing",
+        )?;
 
         let api_key_env = api_config
             .api_key_env
@@ -553,9 +552,11 @@ mod tests {
         }
     }
 
+    type FakeBehavior = dyn FnMut(&str, &[SearchResult]) -> Result<Vec<f64>> + Send;
+
     /// Fake reranker driven by a closure so each test states its own behaviour.
     struct FakeReranker {
-        behavior: Mutex<Box<dyn FnMut(&str, &[SearchResult]) -> Result<Vec<f64>> + Send>>,
+        behavior: Mutex<Box<FakeBehavior>>,
     }
 
     impl FakeReranker {
