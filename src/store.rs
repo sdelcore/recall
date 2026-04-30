@@ -709,7 +709,7 @@ impl Store {
             .as_secs() as i64;
 
         let content = std::fs::read_to_string(path)?;
-        let chunks = chunk_markdown(&content, file_path);
+        let chunks = crate::chunker::chunk_file(&content, file_path);
 
         self.delete_embeddings_for_file(collection_id, file_path)?;
 
@@ -999,20 +999,6 @@ pub struct OrphanCounts {
     pub embeddings: i64,
 }
 
-/// A chunk of text with metadata
-#[derive(Debug, Clone)]
-struct Chunk {
-    content: String,
-    start_line: i64,
-    end_line: i64,
-    date: Option<String>,
-    section: Option<String>,
-    project: Option<String>,
-    memory_type: Option<String>,
-}
-
-/// Classify a file into a memory type based on its path.
-/// Returns: "semantic", "procedural", "episodic", "skill", or None for general content.
 /// Sanitize a free-text query into something FTS5 will accept as a MATCH
 /// expression. Drops FTS5 operators (`?`, `:`, `"`, parentheses, etc.) so
 /// natural-language queries from users / classifiers don't blow up with
@@ -1030,69 +1016,4 @@ fn sanitize_fts_query(query: &str) -> String {
         })
         .collect();
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn classify_memory_type(file_path: &str) -> Option<String> {
-    let path_lower = file_path.to_lowercase();
-
-    // Skills directory
-    if path_lower.contains("/aria/skills/") {
-        return Some("skill".to_string());
-    }
-
-    // ARIA core files
-    if path_lower.ends_with("/memory.md") && path_lower.contains("/aria/") {
-        return Some("semantic".to_string());
-    }
-    if path_lower.ends_with("/soul.md") || path_lower.ends_with("/user.md") {
-        return Some("semantic".to_string());
-    }
-    if path_lower.ends_with("/issues.md") && path_lower.contains("/aria/") {
-        return Some("procedural".to_string());
-    }
-
-    // Daily notes (both user and ARIA)
-    if path_lower.contains("/daily notes/") || path_lower.contains("/periodic/daily/") {
-        return Some("episodic".to_string());
-    }
-
-    // Messages
-    if path_lower.contains("/aria/messages/") {
-        return Some("episodic".to_string());
-    }
-
-    // Contacts
-    if path_lower.contains("/aria/contacts/") {
-        return Some("semantic".to_string());
-    }
-
-    None
-}
-
-/// Maximum chunk size in characters (~400 tokens). Soft cap — chunks split
-/// only at AST block boundaries, never mid-block (code, list, table).
-const MAX_CHUNK_CHARS: usize = 1600;
-
-/// Chunk markdown content along block boundaries via the AST chunker, then
-/// stamp file-level metadata (date from filename, memory type from path).
-fn chunk_markdown(content: &str, file_path: &str) -> Vec<Chunk> {
-    let memory_type = classify_memory_type(file_path);
-    let date = std::path::Path::new(file_path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .filter(|s| s.len() == 10 && s.chars().nth(4) == Some('-') && s.chars().nth(7) == Some('-'))
-        .map(|s| s.to_string());
-
-    crate::ast::chunk_markdown_ast(content, MAX_CHUNK_CHARS)
-        .into_iter()
-        .map(|raw| Chunk {
-            content: raw.content,
-            start_line: raw.start_line,
-            end_line: raw.end_line,
-            section: raw.section,
-            date: date.clone(),
-            project: None,
-            memory_type: memory_type.clone(),
-        })
-        .collect()
 }

@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod ast;
+mod chunker;
 mod config;
 mod embedder;
 mod intent;
