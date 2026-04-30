@@ -9,9 +9,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, info};
 
 use crate::config::Config;
-use crate::embedder::Embedder;
-use crate::reranker;
-use crate::store::{SearchOptions, Store};
+use crate::search;
+use crate::store::Store;
 
 /// Run the MCP server on stdio (JSON-RPC over newline-delimited JSON).
 pub async fn serve_mcp(config: &Config) -> Result<()> {
@@ -205,66 +204,31 @@ async fn tool_search(args: &Value, config: &Config) -> Result<String> {
         .context("recall_search requires a 'query' string parameter")?;
     let limit = args["limit"].as_u64().unwrap_or(5) as usize;
     let hybrid = args["hybrid"].as_bool().unwrap_or(true);
-    let do_rerank = args["rerank"].as_bool().unwrap_or(false);
+    let rerank = args["rerank"].as_bool().unwrap_or(false);
     let after = args["after"].as_str().map(|s| s.to_string());
-    let collection = args["collection"].as_str();
+    let collection = args["collection"].as_str().map(|s| s.to_string());
 
-    let store = Store::open()?;
-
-    let collection_id = match collection {
-        Some(name) => Some(
-            store
-                .get_collection(name)?
-                .ok_or_else(|| anyhow::anyhow!("Collection {:?} not found", name))?
-                .id,
-        ),
-        None => None,
-    };
-
-    let fetch_limit = if do_rerank {
-        config.reranking.candidates.max(limit)
-    } else {
-        limit
-    };
-
-    let options = SearchOptions {
-        after,
-        project: None,
-        file_pattern: None,
-        collection_id,
-    };
-
-    let mut results = if hybrid {
-        let embedder = Embedder::new_with_config(config);
-        let (embedded, _) = store.get_embedding_stats()?;
-        if embedded == 0 {
-            store.search_fts_filtered(query, fetch_limit, &options)?
-        } else {
-            let query_embedding = embedder.embed(query).await?;
-            store.search_hybrid(
-                query,
-                &query_embedding,
-                fetch_limit,
-                config.search.rrf_k,
-                collection_id,
-            )?
-        }
-    } else {
-        store.search_fts_filtered(query, fetch_limit, &options)?
-    };
-
-    if do_rerank && !results.is_empty() {
-        let mut rerank_config = config.reranking.clone();
-        rerank_config.top_k = limit;
-        results = reranker::rerank(query, results, &rerank_config).await;
-    } else {
-        results.truncate(limit);
-    }
+    let outcome = search::search(
+        config,
+        search::SearchRequest {
+            query: query.to_string(),
+            limit,
+            collection,
+            after,
+            project: None,
+            file_pattern: None,
+            hybrid,
+            rerank,
+            rerank_provider_override: None,
+            auto: false,
+        },
+    )
+    .await?;
 
     let output = json!({
-        "query": query,
-        "result_count": results.len(),
-        "results": results.iter().map(|r| {
+        "query": outcome.query,
+        "result_count": outcome.results.len(),
+        "results": outcome.results.iter().map(|(r, _)| {
             json!({
                 "file": r.file_path,
                 "lines": format!("{}-{}", r.start_line, r.end_line),
