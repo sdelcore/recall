@@ -7,6 +7,7 @@ mod embedder;
 mod intent;
 mod mcp;
 mod reranker;
+mod search;
 mod store;
 mod watcher;
 
@@ -315,134 +316,41 @@ async fn run_search(
     project: Option<String>,
     file: Option<String>,
     collection: Option<String>,
-    mut hybrid: bool,
+    hybrid: bool,
     rerank: bool,
     rerank_provider: Option<String>,
     trace: bool,
     auto: bool,
 ) -> Result<()> {
-    let store = store::Store::open()?;
-    let limit = limit.unwrap_or(config.search.default_limit);
-    let mut do_rerank = rerank || config.reranking.enabled;
+    let outcome = search::search(
+        config,
+        search::SearchRequest {
+            query: query.to_string(),
+            limit: limit.unwrap_or(config.search.default_limit),
+            collection,
+            after,
+            project,
+            file_pattern: file,
+            hybrid,
+            rerank,
+            rerank_provider_override: rerank_provider,
+            auto,
+        },
+    )
+    .await?;
 
-    // Heuristic intent classification (always computed; surfaced in trace).
-    let classified = intent::classify(query);
-
-    // --auto routes params from intent unless the user already overrode them
-    // explicitly on the CLI.
-    let mut after = after;
-    if auto {
-        match classified.intent {
-            intent::Intent::Exploratory => {
-                hybrid = true;
-                do_rerank = true;
-            }
-            intent::Intent::Temporal => {
-                if let (None, Some(year)) = (after.as_deref(), classified.year) {
-                    after = Some(format!("{year}-01-01"));
-                }
-            }
-            intent::Intent::Lookup | intent::Intent::Structural => {}
-        }
-    }
-
-    // Resolve collection name → id (None means search across all collections)
-    let collection_id = match collection.as_deref() {
-        Some(name) => Some(
-            store
-                .get_collection(name)?
-                .ok_or_else(|| anyhow::anyhow!("Collection {:?} not found", name))?
-                .id,
-        ),
-        None => None,
-    };
-
-    let fetch_limit = if do_rerank {
-        config.reranking.candidates.max(limit)
-    } else {
-        limit
-    };
-
-    let options = store::SearchOptions {
-        after,
-        project,
-        file_pattern: file,
-        collection_id,
-    };
-
-    let mut traced: Vec<(store::SearchResult, store::SearchTrace)> = if hybrid {
-        let embedder = embedder::Embedder::new_with_config(config);
-        let (embedded, _) = store.get_embedding_stats()?;
-        if embedded == 0 {
-            eprintln!("Warning: No embeddings found. Run 'recall embed' first.");
-            eprintln!("Falling back to BM25 search.\n");
-            store.search_fts_traced(query, fetch_limit, config.search.rrf_k, &options)?
-        } else {
-            let query_embedding = embedder.embed(query).await?;
-            store.search_hybrid_traced(
-                query,
-                &query_embedding,
-                fetch_limit,
-                config.search.rrf_k,
-                collection_id,
-            )?
-        }
-    } else {
-        store.search_fts_traced(query, fetch_limit, config.search.rrf_k, &options)?
-    };
-
-    // LLM reranking
-    if do_rerank && !traced.is_empty() {
-        let mut rerank_config = config.reranking.clone();
-        if let Some(provider) = rerank_provider {
-            rerank_config.provider = provider;
-        }
-        rerank_config.top_k = limit;
-
-        eprintln!(
-            "Reranking {} candidates via {} (top {})...",
-            traced.len(),
-            rerank_config.provider,
-            rerank_config.top_k,
-        );
-
-        // Snapshot pre-rerank traces by chunk identity so we can re-pair
-        // after the reranker reorders + truncates.
-        let mut trace_by_key: std::collections::HashMap<(String, i64, i64), store::SearchTrace> =
-            std::collections::HashMap::new();
-        for (r, t) in &traced {
-            trace_by_key.insert((r.file_path.clone(), r.start_line, r.end_line), t.clone());
-        }
-
-        let plain: Vec<store::SearchResult> = traced.into_iter().map(|(r, _)| r).collect();
-        let reranked = reranker::rerank(query, plain, &rerank_config).await;
-
-        traced = reranked
-            .into_iter()
-            .map(|r| {
-                let key = (r.file_path.clone(), r.start_line, r.end_line);
-                let mut t = trace_by_key.remove(&key).unwrap_or_default();
-                t.rerank_score = Some(r.score);
-                (r, t)
-            })
-            .collect();
-    } else if !do_rerank {
-        traced.truncate(limit);
-    }
-
-    let results: Vec<&store::SearchResult> = traced.iter().map(|(r, _)| r).collect();
-    let trace_active = trace;
-    let format = if trace_active { "json" } else { format };
+    let format = if trace { "json" } else { format };
+    let results: Vec<&store::SearchResult> = outcome.results.iter().map(|(r, _)| r).collect();
 
     match format {
         "json" => {
             let output = serde_json::json!({
-                "query": query,
+                "query": outcome.query,
                 "intent": {
-                    "kind": classified.intent.as_str(),
-                    "year": classified.year,
+                    "kind": outcome.intent.intent.as_str(),
+                    "year": outcome.intent.year,
                 },
-                "results": traced.iter().map(|(r, t)| {
+                "results": outcome.results.iter().map(|(r, t)| {
                     let mut obj = serde_json::json!({
                         "file": r.file_path,
                         "lines": format!("{}-{}", r.start_line, r.end_line),
@@ -456,7 +364,7 @@ async fn run_search(
                             "description": r.collection_description,
                         },
                     });
-                    if trace_active {
+                    if trace {
                         obj["trace"] = serde_json::json!({
                             "bm25_rank": t.bm25_rank,
                             "vec_rank": t.vec_rank,
@@ -470,7 +378,11 @@ async fn run_search(
             println!("{}", serde_json::to_string_pretty(&output)?);
         }
         "full" => {
-            println!("Found {} results for \"{}\":\n", results.len(), query);
+            println!(
+                "Found {} results for \"{}\":\n",
+                results.len(),
+                outcome.query
+            );
             for (i, result) in results.iter().enumerate() {
                 println!(
                     "[{}] {}:{}-{} (score: {:.2})",
@@ -488,7 +400,11 @@ async fn run_search(
         }
         _ => {
             // Compact format (default)
-            println!("Found {} results for \"{}\":\n", results.len(), query);
+            println!(
+                "Found {} results for \"{}\":\n",
+                results.len(),
+                outcome.query
+            );
             for (i, result) in results.iter().enumerate() {
                 println!(
                     "[{}] {}:{}-{} (score: {:.2})",
@@ -498,7 +414,6 @@ async fn run_search(
                     result.end_line,
                     result.score
                 );
-                // Truncate content for compact display
                 let snippet: String = result.content.chars().take(200).collect();
                 let snippet = if result.content.len() > 200 {
                     format!("{}...", snippet.trim())

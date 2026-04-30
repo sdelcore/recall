@@ -535,24 +535,9 @@ impl Store {
         }
     }
 
-    /// Hybrid search combining BM25 and vector search using Reciprocal Rank Fusion
-    pub fn search_hybrid(
-        &self,
-        query: &str,
-        query_embedding: &[f32],
-        limit: usize,
-        rrf_k: u32,
-        collection_id: Option<i64>,
-    ) -> Result<Vec<SearchResult>> {
-        Ok(self
-            .search_hybrid_traced(query, query_embedding, limit, rrf_k, collection_id)?
-            .into_iter()
-            .map(|(r, _t)| r)
-            .collect())
-    }
-
-    /// Same as [`search_hybrid`] but also returns per-result trace info for
-    /// `--trace`: BM25 rank, vector rank, fused RRF score.
+    /// Hybrid search combining BM25 and vector search using Reciprocal Rank
+    /// Fusion. Returns per-result trace info (BM25 rank, vector rank, fused
+    /// RRF score) so callers can render `--trace` output.
     pub fn search_hybrid_traced(
         &self,
         query: &str,
