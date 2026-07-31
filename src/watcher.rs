@@ -5,12 +5,17 @@ use std::path::Path;
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
-use crate::config::Config;
-use crate::store::Store;
+use crate::store::{self, Store};
+
+/// How long the watcher waits for a path to stop changing before it indexes.
+/// Obsidian and Syncthing both write a note several times in a burst; 1.5s is
+/// long enough to collapse the burst and short enough that a save feels
+/// indexed immediately.
+const DEBOUNCE_MS: u64 = 1500;
 
 /// Watch every collection's root_path and auto-index modified files into the
 /// collection that owns the changed file.
-pub fn watch_directories(config: &Config) -> Result<()> {
+pub fn watch_directories() -> Result<()> {
     let store = Store::open()?;
     let collections = store.list_collections()?;
     if collections.is_empty() {
@@ -20,7 +25,7 @@ pub fn watch_directories(config: &Config) -> Result<()> {
     }
 
     let (tx, rx) = channel();
-    let debounce_duration = Duration::from_millis(config.watch.debounce_ms);
+    let debounce_duration = Duration::from_millis(DEBOUNCE_MS);
     let mut debouncer = new_debouncer(debounce_duration, tx)?;
 
     for c in &collections {
@@ -33,8 +38,8 @@ pub fn watch_directories(config: &Config) -> Result<()> {
             .watch(Path::new(&c.root_path), RecursiveMode::Recursive)?;
     }
 
-    println!("Excluding patterns: {:?}", config.watch.exclude);
-    println!("Debounce: {}ms", config.watch.debounce_ms);
+    println!("Excluding patterns: {:?}", store::EXCLUDE_GLOBS);
+    println!("Debounce: {}ms", DEBOUNCE_MS);
     println!();
 
     for result in rx {
@@ -48,7 +53,7 @@ pub fn watch_directories(config: &Config) -> Result<()> {
                     if !path_str.ends_with(".md") {
                         continue;
                     }
-                    if config.should_skip_watch(&path_str) {
+                    if store::is_excluded(&path_str) {
                         continue;
                     }
                     if !event.path.exists() {

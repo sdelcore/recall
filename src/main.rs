@@ -1,30 +1,26 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 mod ast;
 mod chunker;
-mod config;
 mod embedder;
+mod frontmatter;
 mod intent;
+mod lint;
 mod mcp;
 mod reranker;
 mod search;
 mod store;
 mod watcher;
 
-use config::Config;
-
 #[derive(Parser)]
 #[command(name = "recall")]
 #[command(about = "Semantic memory search with token-efficient retrieval")]
 #[command(version)]
+#[command(arg_required_else_help = true)]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Commands>,
-
-    /// Search query (shorthand for `recall search <query>`)
-    #[arg(trailing_var_arg = true)]
-    query: Vec<String>,
+    command: Commands,
 }
 
 #[derive(Subcommand)]
@@ -35,10 +31,10 @@ enum Commands {
         query: String,
 
         /// Maximum number of results
-        #[arg(short, long)]
-        limit: Option<usize>,
+        #[arg(short, long, default_value_t = 5)]
+        limit: usize,
 
-        /// Output format: compact, json, full
+        /// Output format: compact, json
         #[arg(short, long, default_value = "compact")]
         format: String,
 
@@ -46,69 +42,32 @@ enum Commands {
         #[arg(long)]
         after: Option<String>,
 
-        /// Filter by project name
+        /// Only include results before this date (YYYY-MM-DD)
         #[arg(long)]
-        project: Option<String>,
-
-        /// Filter by file pattern (glob)
-        #[arg(long)]
-        file: Option<String>,
+        before: Option<String>,
 
         /// Restrict to a single collection by name
         #[arg(long)]
         collection: Option<String>,
 
-        /// Use hybrid search (BM25 + vector)
-        #[arg(long)]
-        hybrid: bool,
-
-        /// Rerank results using LLM (uses config provider, or --rerank-provider)
+        /// Rerank results using an LLM. Costs seconds; fails loudly if the
+        /// model is unreachable rather than returning unreranked results.
         #[arg(long)]
         rerank: bool,
-
-        /// Override reranking provider (claude-code, anthropic, ollama)
-        #[arg(long)]
-        rerank_provider: Option<String>,
 
         /// Emit per-result diagnostic info (BM25 rank, vec rank, RRF score,
         /// reranker score). Forces JSON output.
         #[arg(long)]
         trace: bool,
-
-        /// Auto-route search params from heuristic intent classification:
-        /// exploratory queries enable hybrid + rerank; temporal queries set
-        /// `--after` from the extracted year.
-        #[arg(long)]
-        auto: bool,
     },
 
-    /// Generate embeddings for indexed chunks
-    Embed {
-        /// Only embed chunks that don't have embeddings
-        #[arg(long)]
-        incremental: bool,
-
-        /// Maximum chunks to embed (for testing)
-        #[arg(long)]
-        limit: Option<usize>,
-    },
+    /// Generate embeddings for indexed chunks that don't have one yet
+    Embed,
 
     /// Index files into the memory database
     Index {
-        /// Path to index (overrides the collection's root_path)
-        #[arg(short, long)]
-        path: Option<String>,
-
-        /// Only index changed files
-        #[arg(long)]
-        incremental: bool,
-
-        /// Index a single file
-        #[arg(long)]
-        file: Option<String>,
-
         /// Collection name. If omitted, indexes every collection at its
-        /// configured root_path.
+        /// registered root_path.
         #[arg(long)]
         collection: Option<String>,
     },
@@ -119,19 +78,38 @@ enum Commands {
         action: CollectionAction,
     },
 
-    /// Manage per-collection descriptions returned alongside search hits
-    Context {
-        #[command(subcommand)]
-        action: ContextAction,
-    },
-
-    /// Database maintenance: integrity checks, VACUUM, FTS rebuild
+    /// Database maintenance: VACUUM, FTS rebuild
     Maintenance {
         #[command(subcommand)]
-        action: Option<MaintenanceAction>,
+        action: MaintenanceAction,
     },
 
-    /// Show index status and statistics
+    /// Check vault links: dangling wikilinks and orphaned notes
+    #[command(
+        long_about = "Check vault links: dangling wikilinks and orphaned notes.\n\n\
+        A link resolves when ANY registered collection holds the target, so a \
+        cross-project link is not a finding. Only an UNRESOLVED link — target found \
+        nowhere — is reported.\n\n\
+        An ORPHAN is a note with zero incoming AND zero outgoing wikilinks. Notes \
+        that are daily notes or session logs are never reported as orphans.\n\n\
+        Links inside fenced code blocks, inline code, and %%Obsidian comments%% are \
+        ignored. Resolution matches note basenames and frontmatter `aliases:`.\n\n\
+        Warn-only: lint reads the filesystem, changes nothing, and never runs as part \
+        of indexing. Findings never change the exit code; only a usage error does. The \
+        report goes to stdout; redirect it somewhere outside the vault if you want to \
+        keep it."
+    )]
+    Lint {
+        /// Restrict findings to a single collection by name
+        #[arg(long)]
+        collection: Option<String>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Show index status, statistics, and health
     Status {
         /// Output as JSON
         #[arg(long)]
@@ -141,62 +119,16 @@ enum Commands {
     /// Watch for file changes and auto-index
     Watch,
 
-    /// Manage configuration
-    Config {
-        #[command(subcommand)]
-        action: ConfigAction,
-    },
-
     /// Start MCP server (stdio transport) for Claude Code integration
-    Serve {
-        /// Transport mode
-        #[arg(long, default_value = "mcp")]
-        mode: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum ConfigAction {
-    /// Show current configuration
-    Show,
-    /// Show config file path
-    Path,
+    Serve,
 }
 
 #[derive(Subcommand)]
 enum MaintenanceAction {
-    /// Read-only integrity checks: PRAGMA integrity_check + orphan counts
-    Check {
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
     /// VACUUM the database (reclaims space after deletes)
     Vacuum,
     /// Drop and rebuild the FTS5 index from chunks
     RebuildFts,
-}
-
-#[derive(Subcommand)]
-enum ContextAction {
-    /// Set or replace the description for a collection
-    Add {
-        /// Collection name
-        collection: String,
-        /// Description text returned alongside search results from this collection
-        description: String,
-    },
-    /// List all collections and their descriptions
-    List {
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Clear the description for a collection
-    Remove {
-        /// Collection name
-        collection: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -208,6 +140,20 @@ enum CollectionAction {
         /// Name for the collection (must be unique)
         #[arg(long)]
         name: String,
+    },
+    /// Set or clear a collection's recency half-life (days)
+    HalfLife {
+        /// Collection name
+        collection: String,
+        /// Half-life in days. Omit to clear it.
+        days: Option<f64>,
+    },
+    /// Set or clear the description returned alongside this collection's hits
+    Describe {
+        /// Collection name
+        collection: String,
+        /// Description text. Omit to clear it.
+        description: Option<String>,
     },
     /// List all collections
     List {
@@ -222,10 +168,21 @@ enum CollectionAction {
     },
 }
 
+/// Expand a leading `~/` to the home directory. Paths reach recall from a
+/// shell that may not have expanded them (a nix activation script, an MCP
+/// argument), and a literal `~` directory is never what the caller meant.
+fn expand_home(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).to_string_lossy().to_string();
+        }
+    }
+    path.to_string()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = Config::load()?;
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -235,122 +192,47 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    // Handle direct query (no subcommand)
-    if !cli.query.is_empty() {
-        let query = cli.query.join(" ");
-        return run_search(
-            &config, &query, None, "compact", None, None, None, None, false, false, None, false,
-            false,
-        )
-        .await;
-    }
-
     match cli.command {
-        Some(Commands::Search {
+        Commands::Search {
             query,
             limit,
             format,
             after,
-            project,
-            file,
+            before,
             collection,
-            hybrid,
             rerank,
-            rerank_provider,
             trace,
-            auto,
-        }) => {
-            run_search(
-                &config,
-                &query,
+        } => {
+            let request = search::SearchRequest {
+                query,
                 limit,
-                &format,
-                after,
-                project,
-                file,
                 collection,
-                hybrid,
+                after,
+                before,
                 rerank,
-                rerank_provider,
-                trace,
-                auto,
-            )
-            .await
+            };
+            let format = if trace { "json" } else { format.as_str() };
+            run_search(request, format, trace).await
         }
-        Some(Commands::Index {
-            path,
-            incremental,
-            file,
-            collection,
-        }) => run_index(path, incremental, file, collection).await,
-        Some(Commands::Collection { action }) => run_collection(action),
-        Some(Commands::Context { action }) => run_context(action),
-        Some(Commands::Maintenance { action }) => run_maintenance(action),
-        Some(Commands::Embed { incremental, limit }) => {
-            run_embed(&config, incremental, limit).await
-        }
-        Some(Commands::Status { json }) => run_status(json).await,
-        Some(Commands::Watch) => run_watch(&config),
-        Some(Commands::Config { action }) => run_config(&config, action),
-        Some(Commands::Serve { mode }) => {
-            if mode != "mcp" {
-                anyhow::bail!("Unknown serve mode: {}. Only 'mcp' is supported.", mode);
-            }
-            mcp::serve_mcp(&config).await
-        }
-        None => {
-            // No command and no query - show help
-            use clap::CommandFactory;
-            Cli::command().print_help()?;
-            Ok(())
-        }
+        Commands::Index { collection } => run_index(collection).await,
+        Commands::Collection { action } => run_collection(action),
+        Commands::Maintenance { action } => run_maintenance(action),
+        Commands::Lint { collection, json } => run_lint(collection, json),
+        Commands::Embed => run_embed().await,
+        Commands::Status { json } => run_status(json).await,
+        Commands::Watch => run_watch(),
+        Commands::Serve => mcp::serve_mcp().await,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_search(
-    config: &Config,
-    query: &str,
-    limit: Option<usize>,
-    format: &str,
-    after: Option<String>,
-    project: Option<String>,
-    file: Option<String>,
-    collection: Option<String>,
-    hybrid: bool,
-    rerank: bool,
-    rerank_provider: Option<String>,
-    trace: bool,
-    auto: bool,
-) -> Result<()> {
-    let outcome = search::search(
-        config,
-        search::SearchRequest {
-            query: query.to_string(),
-            limit: limit.unwrap_or(config.search.default_limit),
-            collection,
-            after,
-            project,
-            file_pattern: file,
-            hybrid,
-            rerank,
-            rerank_provider_override: rerank_provider,
-            auto,
-        },
-    )
-    .await?;
-
-    let format = if trace { "json" } else { format };
+async fn run_search(request: search::SearchRequest, format: &str, trace: bool) -> Result<()> {
+    let outcome = search::search(request).await?;
     let results: Vec<&store::SearchResult> = outcome.results.iter().map(|(r, _)| r).collect();
 
     match format {
         "json" => {
             let output = serde_json::json!({
                 "query": outcome.query,
-                "intent": {
-                    "kind": outcome.intent.intent.as_str(),
-                    "year": outcome.intent.year,
-                },
                 "results": outcome.results.iter().map(|(r, t)| {
                     let mut obj = serde_json::json!({
                         "file": r.file_path,
@@ -358,8 +240,9 @@ async fn run_search(
                         "score": r.score,
                         "snippet": r.content,
                         "date": r.date,
+                        "date_source": r.date_source,
                         "section": r.section,
-                        "memory_type": r.memory_type,
+                        "status": r.status,
                         "collection": {
                             "name": r.collection_name,
                             "description": r.collection_description,
@@ -371,33 +254,14 @@ async fn run_search(
                             "vec_rank": t.vec_rank,
                             "rrf_score": t.rrf_score,
                             "rerank_score": t.rerank_score,
+                            "decay_factor": t.decay_factor,
+                            "pre_decay_score": t.pre_decay_score,
                         });
                     }
                     obj
                 }).collect::<Vec<_>>()
             });
             println!("{}", serde_json::to_string_pretty(&output)?);
-        }
-        "full" => {
-            println!(
-                "Found {} results for \"{}\":\n",
-                results.len(),
-                outcome.query
-            );
-            for (i, result) in results.iter().enumerate() {
-                println!(
-                    "[{}] {}:{}-{} (score: {:.2})",
-                    i + 1,
-                    result.file_path,
-                    result.start_line,
-                    result.end_line,
-                    result.score
-                );
-                if let Some(section) = &result.section {
-                    println!("Section: {}", section);
-                }
-                println!("{}\n", result.content);
-            }
         }
         _ => {
             // Compact format (default)
@@ -429,12 +293,7 @@ async fn run_search(
     Ok(())
 }
 
-async fn run_index(
-    path: Option<String>,
-    incremental: bool,
-    file: Option<String>,
-    collection: Option<String>,
-) -> Result<()> {
+async fn run_index(collection: Option<String>) -> Result<()> {
     let store = store::Store::open()?;
 
     // Resolve target collections.
@@ -446,10 +305,6 @@ async fn run_index(
             )
         })?;
         vec![c]
-    } else if path.is_some() || file.is_some() {
-        anyhow::bail!(
-            "--path / --file require --collection to specify which collection to index into."
-        );
     } else {
         let cs = store.list_collections()?;
         if cs.is_empty() {
@@ -461,38 +316,13 @@ async fn run_index(
         cs
     };
 
-    if let Some(file_path) = file {
-        let target = &targets[0];
-        println!(
-            "Indexing single file into collection {:?}: {}",
-            target.name, file_path
-        );
-        store.index_file(target.id, &file_path)?;
-        println!("Done.");
-        return Ok(());
-    }
-
     for target in &targets {
-        let index_path = match &path {
-            Some(p) => config::expand_home(p),
-            None => target.root_path.clone(),
-        };
+        let index_path = target.root_path.clone();
         if index_path.is_empty() {
-            anyhow::bail!(
-                "Collection {:?} has no root_path; pass --path to index something explicit.",
-                target.name
-            );
+            anyhow::bail!("Collection {:?} has no root_path to index.", target.name);
         }
-        if incremental {
-            println!(
-                "Incremental indexing collection {:?}: {}",
-                target.name, index_path
-            );
-            store.index_incremental(target.id, &index_path)?;
-        } else {
-            println!("Full indexing collection {:?}: {}", target.name, index_path);
-            store.index_full(target.id, &index_path)?;
-        }
+        println!("Indexing collection {:?}: {}", target.name, index_path);
+        store.index(target.id, &index_path)?;
     }
 
     let stats = store.get_stats()?;
@@ -507,14 +337,44 @@ fn run_collection(action: CollectionAction) -> Result<()> {
     let store = store::Store::open()?;
     match action {
         CollectionAction::Add { path, name } => {
-            let abs = config::expand_home(&path);
+            let abs = expand_home(&path);
+            // A root that does not resolve is a typo, not a value to store.
+            // `recall collection add ~/Obsidan` used to succeed; the root then
+            // matched no file on disk, so indexing and the watcher both did
+            // nothing forever and said nothing about it.
             let canon = std::path::Path::new(&abs)
                 .canonicalize()
-                .unwrap_or_else(|_| std::path::PathBuf::from(&abs))
+                .with_context(|| format!("Collection root does not exist: {}", abs))?
                 .to_string_lossy()
                 .to_string();
             let c = store.create_collection(&name, &canon)?;
             println!("Added collection {:?} → {}", c.name, c.root_path);
+        }
+        CollectionAction::HalfLife { collection, days } => {
+            if let Some(d) = days {
+                if d <= 0.0 {
+                    anyhow::bail!("Half-life must be positive (got {})", d);
+                }
+            }
+            if !store.set_collection_half_life(&collection, days)? {
+                anyhow::bail!("Collection {:?} not found", collection);
+            }
+            match days {
+                Some(d) => println!("Set half-life for {:?} to {} days", collection, d),
+                None => println!("Cleared half-life for {:?}", collection),
+            }
+        }
+        CollectionAction::Describe {
+            collection,
+            description,
+        } => {
+            if !store.set_collection_description(&collection, description.as_deref())? {
+                anyhow::bail!("Collection {:?} not found", collection);
+            }
+            match description {
+                Some(_) => println!("Set description for {:?}", collection),
+                None => println!("Cleared description for {:?}", collection),
+            }
         }
         CollectionAction::List { json } => {
             let cs = store.list_collections()?;
@@ -526,7 +386,15 @@ fn run_collection(action: CollectionAction) -> Result<()> {
                 );
             } else {
                 for c in cs {
-                    println!("{:<20} {}", c.name, c.root_path);
+                    let half_life = match c.half_life_days {
+                        Some(d) => format!("{}d", d),
+                        None => "-".to_string(),
+                    };
+                    let description = c.description.as_deref().unwrap_or("-");
+                    println!(
+                        "{:<20} {:<8} {:<40} {}",
+                        c.name, half_life, c.root_path, description
+                    );
                 }
             }
         }
@@ -541,96 +409,9 @@ fn run_collection(action: CollectionAction) -> Result<()> {
     Ok(())
 }
 
-fn run_context(action: ContextAction) -> Result<()> {
+fn run_maintenance(action: MaintenanceAction) -> Result<()> {
     let store = store::Store::open()?;
     match action {
-        ContextAction::Add {
-            collection,
-            description,
-        } => {
-            if !store.set_collection_description(&collection, Some(&description))? {
-                anyhow::bail!("Collection {:?} not found", collection);
-            }
-            println!("Set description for {:?}", collection);
-        }
-        ContextAction::List { json } => {
-            let cs = store.list_collections()?;
-            if json {
-                let payload: Vec<serde_json::Value> = cs
-                    .into_iter()
-                    .map(|c| {
-                        serde_json::json!({
-                            "name": c.name,
-                            "description": c.description,
-                        })
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&payload)?);
-            } else if cs.is_empty() {
-                println!("No collections.");
-            } else {
-                for c in cs {
-                    let d = c.description.as_deref().unwrap_or("(no description)");
-                    println!("{:<20} {}", c.name, d);
-                }
-            }
-        }
-        ContextAction::Remove { collection } => {
-            if !store.set_collection_description(&collection, None)? {
-                anyhow::bail!("Collection {:?} not found", collection);
-            }
-            println!("Cleared description for {:?}", collection);
-        }
-    }
-    Ok(())
-}
-
-fn run_maintenance(action: Option<MaintenanceAction>) -> Result<()> {
-    let store = store::Store::open()?;
-    match action.unwrap_or(MaintenanceAction::Check { json: false }) {
-        MaintenanceAction::Check { json } => {
-            let integrity = store.integrity_check()?;
-            let orphans = store.orphan_counts()?;
-            let stats = store.get_stats()?;
-            let healthy = integrity == "ok"
-                && orphans.chunks == 0
-                && orphans.files == 0
-                && orphans.embeddings == 0;
-            if json {
-                let out = serde_json::json!({
-                    "integrity": integrity,
-                    "orphans": {
-                        "chunks": orphans.chunks,
-                        "files": orphans.files,
-                        "embeddings": orphans.embeddings,
-                    },
-                    "files": stats.file_count,
-                    "chunks": stats.chunk_count,
-                    "healthy": healthy,
-                });
-                println!("{}", serde_json::to_string_pretty(&out)?);
-            } else {
-                println!("Recall Maintenance");
-                println!("==================");
-                println!("Integrity:           {}", integrity);
-                println!("Orphan chunks:       {}", orphans.chunks);
-                println!("Orphan files:        {}", orphans.files);
-                println!("Orphan embeddings:   {}", orphans.embeddings);
-                println!("Files:               {}", stats.file_count);
-                println!("Chunks:              {}", stats.chunk_count);
-                println!(
-                    "Status:              {}",
-                    if healthy {
-                        "healthy"
-                    } else {
-                        "needs attention"
-                    }
-                );
-            }
-            if !healthy {
-                anyhow::bail!("DB needs attention (see counts above)");
-            }
-        }
         MaintenanceAction::Vacuum => {
             store.vacuum()?;
             println!("VACUUM complete.");
@@ -643,11 +424,70 @@ fn run_maintenance(action: Option<MaintenanceAction>) -> Result<()> {
     Ok(())
 }
 
+/// Warn-only vault link check. Every collection is scanned so a link can be
+/// resolved across collections; `collection` only narrows what is reported.
+fn run_lint(collection: Option<String>, json: bool) -> Result<()> {
+    let store = store::Store::open()?;
+    let collections = store.list_collections()?;
+    if collections.is_empty() {
+        anyhow::bail!(
+            "No collections registered. Add one with \
+             `recall collection add <path> --name <name>` and re-run."
+        );
+    }
+    if let Some(name) = collection.as_deref() {
+        if !collections.iter().any(|c| c.name == name) {
+            anyhow::bail!("Collection {:?} not found", name);
+        }
+    }
+
+    let report = lint::lint(&collections, collection.as_deref())?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", render_lint(&report));
+    }
+    Ok(())
+}
+
+fn render_lint(report: &lint::LintReport) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(s, "Recall Lint");
+    let _ = writeln!(s, "===========");
+    let _ = writeln!(s, "Notes scanned:       {}", report.notes_scanned);
+    let _ = writeln!(s, "Links:               {}", report.links_total);
+    let _ = writeln!(s, "  resolved:          {}", report.resolved);
+    let _ = writeln!(s, "  unresolved:        {}", report.unresolved.len());
+    let _ = writeln!(s, "Orphans:             {}", report.orphans.len());
+
+    if !report.unresolved.is_empty() {
+        let _ = writeln!(s, "\nUnresolved links:");
+        for link in &report.unresolved {
+            let _ = writeln!(s, "  {}:{}  [[{}]]", link.file, link.line, link.target);
+        }
+    }
+    if !report.orphans.is_empty() {
+        let _ = writeln!(s, "\nOrphans (no incoming and no outgoing links):");
+        for path in &report.orphans {
+            let _ = writeln!(s, "  {}", path);
+        }
+    }
+    s
+}
+
+/// Index status plus the read-only health checks. Both answer "is the index
+/// usable?", so they are one command: a caller that reads the counts is
+/// exactly the caller that needs to know the counts are trustworthy.
 async fn run_status(json: bool) -> Result<()> {
     let store = store::Store::open()?;
-    let config = Config::load()?;
     let stats = store.get_stats()?;
     let (embedded, _) = store.get_embedding_stats()?;
+    let integrity = store.integrity_check()?;
+    let orphans = store.orphan_counts()?;
+    let collections = store.list_collections()?;
+    let healthy =
+        integrity == "ok" && orphans.chunks == 0 && orphans.files == 0 && orphans.embeddings == 0;
 
     if json {
         let output = serde_json::json!({
@@ -656,19 +496,30 @@ async fn run_status(json: bool) -> Result<()> {
             "embedded_count": embedded,
             "last_indexed": stats.last_indexed,
             "database_path": store.path(),
-            "config_path": Config::config_path(),
-            "watch_paths": config.watch_paths(),
-            "index_paths": config.index_paths(),
+            "collection_roots": collections.iter()
+                .map(|c| c.root_path.as_str())
+                .collect::<Vec<_>>(),
+            "integrity": integrity,
+            "orphans": {
+                "chunks": orphans.chunks,
+                "files": orphans.files,
+                "embeddings": orphans.embeddings,
+            },
+            "healthy": healthy,
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         println!("Recall Status");
         println!("=============");
         println!("Database: {}", store.path());
-        println!("Config: {}", Config::config_path().display());
         println!();
-        println!("Index paths: {:?}", config.index_paths());
-        println!("Watch paths: {:?}", config.watch_paths());
+        println!("Collections:");
+        if collections.is_empty() {
+            println!("  (none)");
+        }
+        for c in &collections {
+            println!("  {:<20} {}", c.name, c.root_path);
+        }
         println!();
         println!("Files indexed: {}", stats.file_count);
         println!("Chunks stored: {}", stats.chunk_count);
@@ -685,60 +536,41 @@ async fn run_status(json: bool) -> Result<()> {
         if let Some(last) = stats.last_indexed {
             println!("Last indexed: {}", last);
         }
+        println!();
+        println!("Integrity: {}", integrity);
+        println!("Orphan chunks: {}", orphans.chunks);
+        println!("Orphan files: {}", orphans.files);
+        println!("Orphan embeddings: {}", orphans.embeddings);
+        println!(
+            "Health: {}",
+            if healthy {
+                "healthy"
+            } else {
+                "needs attention"
+            }
+        );
     }
 
     Ok(())
 }
 
-fn run_watch(config: &Config) -> Result<()> {
+fn run_watch() -> Result<()> {
     println!("Recall File Watcher");
     println!("===================");
-    watcher::watch_directories(config)
+    watcher::watch_directories()
 }
 
-fn run_config(config: &Config, action: ConfigAction) -> Result<()> {
-    match action {
-        ConfigAction::Show => {
-            println!("Configuration (from {:?}):", Config::config_path());
-            println!();
-            println!("[index]");
-            println!("paths = {:?}", config.index.paths);
-            println!("exclude = {:?}", config.index.exclude);
-            println!();
-            println!("[embeddings]");
-            println!("ollama_url = \"{}\"", config.embeddings.ollama_url);
-            println!("model = \"{}\"", config.embeddings.model);
-            println!();
-            println!("[search]");
-            println!("default_limit = {}", config.search.default_limit);
-            println!("rrf_k = {}", config.search.rrf_k);
-            println!();
-            println!("[watch]");
-            println!("paths = {:?}", config.watch.paths);
-            println!("exclude = {:?}", config.watch.exclude);
-            println!("debounce_ms = {}", config.watch.debounce_ms);
-        }
-        ConfigAction::Path => {
-            println!("{}", Config::config_path().display());
-        }
-    }
-
-    Ok(())
-}
-
-async fn run_embed(config: &Config, incremental: bool, limit: Option<usize>) -> Result<()> {
+async fn run_embed() -> Result<()> {
     let store = store::Store::open()?;
-    let embedder = embedder::Embedder::new_with_config(config);
+    let embedder = embedder::Embedder::new();
 
     // Check Ollama connectivity
-    println!(
-        "Checking Ollama connectivity at {}...",
-        config.embeddings.ollama_url
-    );
+    println!("Checking Ollama connectivity at {}...", embedder.url());
     if !embedder.health_check().await? {
         anyhow::bail!(
-            "Cannot connect to Ollama at {}. Is it running?",
-            config.embeddings.ollama_url
+            "Cannot connect to Ollama at {}. Is it running? \
+             Set RECALL_OLLAMA_URL if it lives elsewhere.",
+            embedder.url()
         );
     }
     println!("Ollama is available.");
@@ -746,19 +578,11 @@ async fn run_embed(config: &Config, incremental: bool, limit: Option<usize>) -> 
     // Ensure model is pulled
     embedder.ensure_model().await?;
 
-    // Get chunks that need embeddings
-    let chunks = if incremental {
-        store.get_chunks_without_embeddings()?
-    } else {
-        // For non-incremental, we'd need to get all chunks
-        // For now, just do incremental (only missing)
-        store.get_chunks_without_embeddings()?
-    };
-
-    let total = match limit {
-        Some(l) => chunks.len().min(l),
-        None => chunks.len(),
-    };
+    // Chunks that need embeddings. Embedding is always incremental: a chunk's
+    // vector cannot go stale without the chunk itself being rewritten, and a
+    // rewrite drops the old row.
+    let chunks = store.get_chunks_without_embeddings()?;
+    let total = chunks.len();
 
     if total == 0 {
         println!("All chunks already have embeddings.");
@@ -767,13 +591,14 @@ async fn run_embed(config: &Config, incremental: bool, limit: Option<usize>) -> 
 
     println!(
         "Generating embeddings for {} chunks using {}...\n",
-        total, config.embeddings.model
+        total,
+        embedder::EMBEDDING_MODEL
     );
 
     let mut success_count = 0;
     let mut error_count = 0;
 
-    for (i, (chunk_id, content)) in chunks.iter().take(total).enumerate() {
+    for (i, (chunk_id, content)) in chunks.iter().enumerate() {
         // Progress indicator
         print!("\r[{}/{}] Embedding chunk {}...", i + 1, total, chunk_id);
         std::io::Write::flush(&mut std::io::stdout())?;

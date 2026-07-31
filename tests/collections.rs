@@ -7,6 +7,34 @@ use common::{write_fixture_vault, RecallSandbox};
 use predicates::prelude::*;
 use tempfile::tempdir;
 
+/// A misspelled root is rejected at `collection add`, not stored.
+///
+/// `recall collection add ~/Obsidan` used to succeed: the path failed to
+/// canonicalize and was kept verbatim. Nothing on disk ever matched it, so
+/// `recall index` found no files and the watcher watched a directory that does
+/// not exist — both silently, forever.
+#[test]
+fn a_root_that_does_not_exist_is_rejected() {
+    let sandbox = RecallSandbox::new();
+    let parent = tempdir().unwrap();
+
+    sandbox
+        .cmd()
+        .args(["collection", "add"])
+        .arg(parent.path().join("Obsidan"))
+        .args(["--name", "typo"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Collection root does not exist"));
+
+    sandbox
+        .cmd()
+        .args(["collection", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No collections"));
+}
+
 #[test]
 fn collection_add_list_remove_lifecycle() {
     let sandbox = RecallSandbox::new();
@@ -127,21 +155,6 @@ fn search_filters_by_collection() {
 }
 
 #[test]
-fn index_without_collection_fails_when_path_given() {
-    let sandbox = RecallSandbox::new();
-    let vault = tempdir().unwrap();
-    write_fixture_vault(vault.path());
-
-    sandbox
-        .cmd()
-        .args(["index", "--path"])
-        .arg(vault.path())
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("require --collection"));
-}
-
-#[test]
 fn index_without_any_collections_fails() {
     let sandbox = RecallSandbox::new();
     sandbox
@@ -153,7 +166,7 @@ fn index_without_any_collections_fails() {
 }
 
 #[test]
-fn context_description_appears_in_search_results() {
+fn collection_description_appears_in_search_results() {
     let sandbox = RecallSandbox::new();
     let vault = tempdir().unwrap();
     write_fixture_vault(vault.path());
@@ -168,7 +181,12 @@ fn context_description_appears_in_search_results() {
 
     sandbox
         .cmd()
-        .args(["context", "add", "notes", "Personal notes and stray ideas"])
+        .args([
+            "collection",
+            "describe",
+            "notes",
+            "Personal notes and stray ideas",
+        ])
         .assert()
         .success();
 
@@ -191,8 +209,10 @@ fn context_description_appears_in_search_results() {
         }));
 }
 
+/// `collection describe <name>` with no text clears the column, mirroring
+/// `collection half-life <name>` with no days.
 #[test]
-fn context_remove_clears_description() {
+fn describe_without_text_clears_the_description() {
     let sandbox = RecallSandbox::new();
     let vault = tempdir().unwrap();
     write_fixture_vault(vault.path());
@@ -207,25 +227,36 @@ fn context_remove_clears_description() {
 
     sandbox
         .cmd()
-        .args(["context", "add", "notes", "first description"])
+        .args(["collection", "describe", "notes", "first description"])
         .assert()
         .success();
 
     sandbox
         .cmd()
-        .args(["context", "remove", "notes"])
+        .args(["collection", "describe", "notes"])
         .assert()
         .success();
 
     sandbox
         .cmd()
-        .args(["context", "list", "--json"])
+        .args(["collection", "list", "--json"])
         .assert()
         .success()
         .stdout(predicate::function(|out: &str| {
             let v: serde_json::Value = serde_json::from_str(out).unwrap();
             v[0]["description"].is_null()
         }));
+}
+
+#[test]
+fn describe_on_unknown_collection_fails() {
+    let sandbox = RecallSandbox::new();
+    sandbox
+        .cmd()
+        .args(["collection", "describe", "missing", "text"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not found"));
 }
 
 #[test]
