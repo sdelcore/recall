@@ -23,7 +23,7 @@
 //! shipped code path rather than from a second one.
 //!
 //! Hermetic and BM25-only: temp dirs throughout (via `RecallSandbox`), no
-//! embeddings, no Ollama, no LLM. Every fixture date is written relative to
+//! embeddings, no model weights, no LLM. Every fixture date is written relative to
 //! today, so the corpus ages with the calendar and the snapshot does not rot.
 
 mod common;
@@ -54,7 +54,7 @@ const LABELED: &[(&str, &str)] = &[
     ("orchestrator persona", "projects/aria-overview.md"),
     ("reciprocal rank fusion", "reference/rank-fusion.md"),
     ("unicode61 tokenizer", "reference/sqlite-fts5.md"),
-    ("nomic embed", "reference/ollama-embeddings.md"),
+    ("bge small", "reference/local-embeddings.md"),
     ("batch size", "sessions/embedding-tuning.md"),
     ("trigger sync", "sessions/fts-debugging.md"),
     ("dentist appointment", "notes/standup.md"),
@@ -341,12 +341,12 @@ fn write_ranking_vault(root: &Path) {
             ),
         ),
         (
-            "reference/ollama-embeddings.md",
+            "reference/local-embeddings.md",
             format!(
                 "---\ndate: {}\nstatus: current\n---\n\n\
-                 # Ollama embeddings\n\n\
-                 The nomic-embed-text model returns a 768 dimension vector per input and\n\
-                 runs entirely on the local machine.\n",
+                 # Local embeddings\n\n\
+                 The bge-small-en-v1.5 model returns a 384 dimension vector per input and\n\
+                 runs entirely in process on the local machine.\n",
                 days_ago(400)
             ),
         ),

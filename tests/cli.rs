@@ -1,6 +1,6 @@
 //! End-to-end CLI tests. Exercises `recall index`, `recall search`,
-//! and `recall status` against a tempdir vault using BM25 only — no Ollama
-//! or LLM reranker required, so this runs unchanged on CI.
+//! and `recall status` against a tempdir vault using BM25 only — no model
+//! weights or LLM reranker required, so this runs unchanged on CI.
 
 mod common;
 

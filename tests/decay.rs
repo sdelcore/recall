@@ -1,4 +1,4 @@
-//! Recency decay e2e tests. BM25-only (no Ollama needed), driven through
+//! Recency decay e2e tests. BM25-only (nothing is ever embedded), driven through
 //! `recall search --trace` so the assertions read the same numbers a user
 //! debugging their ranking would see.
 //!

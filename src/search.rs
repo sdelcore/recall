@@ -110,6 +110,12 @@ pub async fn search_with_store(store: &Store, mut request: SearchRequest) -> Res
 /// Hybrid retrieval, degrading to BM25 when the index has no vectors. There
 /// is no keyword-only mode to ask for: the fusion is strictly better when
 /// embeddings exist, and this is the only place that can tell whether they do.
+///
+/// An empty vector table is a normal state, not a broken one — `recall index`
+/// writes chunks and `recall embed` writes vectors, so a freshly indexed vault
+/// lands here until the second command runs. The model itself is in-process
+/// and always available, so the warning names the missing step rather than
+/// suggesting anything is wrong with the host.
 async fn run_retrieval(
     store: &Store,
     query: &str,
@@ -118,12 +124,12 @@ async fn run_retrieval(
 ) -> Result<Vec<(SearchResult, SearchTrace)>> {
     let (embedded, _) = store.get_embedding_stats()?;
     if embedded == 0 {
-        warn!("No embeddings found; falling back to BM25. Run 'recall embed' to enable hybrid.");
+        warn!("This index has no embeddings yet, so this search is keyword-only. Run 'recall embed' to add them.");
         return store.search_fts_traced(query, fetch_limit, options);
     }
 
-    let embedder = Embedder::new();
-    let query_embedding = embedder.embed(query).await?;
+    let embedder = Embedder::load()?;
+    let query_embedding = embedder.embed_query(query)?;
     store.search_hybrid_traced(query, &query_embedding, fetch_limit, options)
 }
 
