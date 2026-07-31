@@ -171,7 +171,19 @@ in
 
         $DRY_RUN_CMD mkdir -p "$(dirname ${shQuote cfg.dbPath})"
 
-        existing="$(recall collection list --json 2>/dev/null || echo '[]')"
+        # No `2>/dev/null || echo '[]'` here. `collection list` already returns
+        # `[]` on a database that does not exist yet, so the fallback never
+        # covered the fresh-install case it looked like it was for. The only
+        # thing it caught was a real error, and it reported that as "nothing is
+        # registered" — so every block below took the add branch and
+        # `collection add` failed on `UNIQUE constraint failed:
+        # collections.name` against rows that were there all along. The
+        # activation script runs under `set -eu -o pipefail`, so letting the
+        # failure through stops it on recall's own message instead. Same rule
+        # the store follows: a database that reports itself as empty is
+        # indistinguishable from a fresh install, and every consumer draws the
+        # wrong conclusion from that.
+        existing="$(recall collection list --json)"
 
         ${lib.concatStringsSep "\n" (lib.mapAttrsToList reconcileOne cfg.collections)}
         ${lib.optionalString cfg.pruneUnmanagedCollections pruneBlock}
