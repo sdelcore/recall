@@ -61,7 +61,17 @@ fn status_json_reports_indexed_counts_and_health() {
     let vault = tempdir().unwrap();
     write_fixture_vault(vault.path());
     add_and_index(&sandbox, vault.path(), "test");
-    let root = vault.path().to_string_lossy().to_string();
+    // `collection add` stores the canonical root, so compare against the
+    // canonical path. On macOS `tempdir()` hands back `/var/folders/...`,
+    // which resolves to `/private/var/folders/...`; on Linux the two are
+    // identical, which is why comparing the raw path passed there and failed
+    // only on macOS.
+    let root = vault
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
 
     sandbox
         .cmd()
