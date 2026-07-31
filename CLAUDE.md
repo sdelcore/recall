@@ -35,7 +35,7 @@ recall/
 │   ├── chunker.rs    # File-level chunk metadata (date cascade, type, status)
 │   ├── frontmatter.rs# Minimal YAML frontmatter scalar scanner
 │   ├── intent.rs     # Temporal query detection (year extraction, decay skip)
-│   ├── embedder.rs   # Ollama HTTP client for embeddings
+│   ├── embedder.rs   # In-process CPU embeddings (candle + BERT)
 │   ├── reranker.rs   # LLM reranking (claude-agent-sdk)
 │   ├── lint.rs       # Vault link linter (dangling wikilinks, orphaned notes)
 │   ├── mcp.rs        # MCP stdio server (recall_search, recall_index, recall_status)
@@ -63,7 +63,7 @@ recall/
 - **Chunker** (`chunker.rs`): wraps `ast.rs` with the file-level metadata stamped onto every chunk from a file — the date cascade and frontmatter `status`. Its heuristics are private and unit-tested in isolation.
 - **Intent** (`intent.rs`): two string-inspection functions, no LLM call, so latency stays predictable. `year()` pulls a 2000-2099 year out of the query, which becomes an `after` bound; `is_temporal()` says whether the query asks about a point in time, which skips recency decay. It used to classify into four buckets, two of which routed nothing and one of which — `structural` — was checked first and actively harmful: `*.md from 2025` matched it and lost both the year bound and the decay skip. Reranking is never routed; it costs seconds, so only `--rerank` turns it on.
 - **Frontmatter** (`frontmatter.rs`): hand-rolled scanner for the leading `---` block. Reads flat scalars only (`date`, `last_updated`, `status`, `type`, `aliases`). No `serde_yaml` — it is unmaintained.
-- **Embedder** (`embedder.rs`): HTTP client for Ollama embedding API. `EMBEDDING_MODEL` (nomic-embed-text, 768-dim) is a const because it is half the index fingerprint; the server URL honors `RECALL_OLLAMA_URL`.
+- **Embedder** (`embedder.rs`): in-process embeddings on the CPU via candle (`candle-transformers` BERT + `tokenizers`). No service, no network at runtime, no native math library, no ONNX runtime — hybrid search works anywhere the binary runs, which is the whole reason for the choice. `EMBEDDING_MODEL` (`BAAI/bge-small-en-v1.5`) and `EMBEDDING_DIM` (384) are consts because both are in the index fingerprint. `load()` costs ~0.6s and then runs ~9 chunks/sec, so callers load once and batch — `recall embed` loads once for the whole run and feeds it `EMBED_BATCH` (32) chunks per forward pass. Vectors are L2-normalized, so a dot product is a cosine. `RECALL_MODEL_PATH` pins a directory of weights and never touches the network; otherwise the weights come from the hf-hub cache. A `config.json` whose `hidden_size` is not 384 is rejected at load time, so the wrong model fails with a sentence rather than a tensor shape error.
 - **Reranker** (`reranker.rs`): LLM-based reranking through the `claude-agent-sdk` crate. No API key needed; all candidates go into one prompt. Reranking failures propagate as errors — degrading to RRF order is invisible to the caller, and over MCP the warning never reaches the model.
 - **MCP** (`mcp.rs`): Model Context Protocol server over stdio. Exposes 3 tools: `recall_search`, `recall_index`, `recall_status`, plus dynamic server instructions on `initialize`. Registered in ARIA's Claude Code MCP config.
 - **Lint** (`lint.rs`): `recall lint` — reads the vault from disk (never the index) and reports dangling wikilinks and orphaned notes. A link resolves against *every* registered collection, so a cross-project link is not a finding. See "Linting" below.
@@ -79,7 +79,7 @@ Location: `~/.local/share/recall/memory.sqlite`. `RECALL_DB_PATH` overrides it.
 | `files` | `id`, `collection_id`, `file_path`, `mtime`, `indexed_at`, `chunk_count`, `UNIQUE(collection_id, file_path)` |
 | `chunks` | `id`, `file_id`, `collection_id`, `date`, `date_source`, `section`, `status`, `start_line`, `end_line`, `content` |
 | `fts_chunks` | FTS5 external-content over `chunks.content`, synced by three triggers |
-| `vec_embeddings` | vec0, `float[768]`, rowid = `chunks.id` |
+| `vec_embeddings` | vec0, `float[EMBEDDING_DIM]` (384), rowid = `chunks.id` |
 | `config` | `key`, `value` — holds `index_fingerprint` and nothing else |
 
 `chunks.collection_id` is denormalized from `files` so a collection-scoped
@@ -97,17 +97,22 @@ so the planner never chose them and they cost every insert.
 No migration code by design, and the fingerprint is the *only* compatibility
 mechanism — there is no second check that refuses to open an old database.
 `config['index_fingerprint']` holds
-`schema=<n>;chunker=<n>;embedding=<model>`, built from `SCHEMA_VERSION`
-(currently 3, bumped when the three columns above were dropped),
-`CHUNKER_VERSION` (currently 3), and `EMBEDDING_MODEL`. On a mismatch,
+`schema=<n>;chunker=<n>;embedding=<model>;dim=<n>`, built from `SCHEMA_VERSION`
+(currently 4, bumped when `vec_embeddings` narrowed to 384),
+`CHUNKER_VERSION` (currently 3), `EMBEDDING_MODEL`, and `EMBEDDING_DIM`. The
+width is in there because `vec_embeddings` is declared with it: a stored row of
+the wrong length cannot be read back at all. On a mismatch,
 `Store::open` drops `files` / `chunks` / `fts_chunks` / `vec_embeddings` and
 the next `recall index` rebuilds them. Collections survive the rebuild.
 
-**A schema or chunker change therefore costs a full reindex plus a full
-`recall embed`** — the vectors go with the chunks, and re-embedding a real
-vault is the slow half. Bump `SCHEMA_VERSION` when the table shape changes and
-`CHUNKER_VERSION` when the chunker's output would differ for unchanged input.
-Never write `ALTER TABLE` or a `migrate_*` helper.
+**A schema, chunker, or embedding change therefore costs a full reindex plus a
+full `recall embed`** — the vectors go with the chunks, and re-embedding a real
+vault is the slow half (~9 chunks/sec). Bump `SCHEMA_VERSION` when the table
+shape changes and `CHUNKER_VERSION` when the chunker's output would differ for
+unchanged input; `EMBEDDING_MODEL` and `EMBEDDING_DIM` need no bump because
+they are in the fingerprint themselves. Changing the model — or the pinned
+revision in `nix/model.nix` — makes every stored vector incomparable, so it
+carries the same cost. Never write `ALTER TABLE` or a `migrate_*` helper.
 
 A chunk's `date` comes from a cascade — frontmatter `date:` /
 `last_updated:`, then a `YYYY-MM-DD` filename, then the file's mtime — and
@@ -141,6 +146,13 @@ strategy: hybrid, always. There is no `--hybrid` flag because the fusion is
 strictly better wherever vectors exist, and only the index knows whether they
 do — with zero embeddings the pipeline degrades to BM25 on its own, so search
 works before `recall embed` has ever run.
+
+The vector half has no external dependency: `run_retrieval` loads the model
+in-process to embed the query, so hybrid search works on every host, and an
+empty `vec_embeddings` means "`recall embed` has not run yet", never "the
+embedding service is unreachable". The cost is that a query with embeddings
+present pays the ~0.6s model load per search — `Embedder::load()` is called
+inside `run_retrieval`, not held across calls.
 
 `--rerank` is the one retrieval knob the caller still holds, and it is the only
 thing that turns reranking on: nothing routes to it, because it costs seconds
@@ -178,7 +190,7 @@ reports `decay_factor` and `pre_decay_score`.
 
 `tests/ranking.rs` is the baseline for every future ranking change. It
 builds a 14-note fixture vault in a temp dir, indexes it, and runs 24 fixed
-queries. BM25-only, so CI needs no Ollama.
+queries. BM25-only, so CI never downloads model weights.
 
 Decay is unconditional, so there is no second profile to run. The comparison
 the old "decay off" profile provided comes from `--trace` instead:
@@ -217,7 +229,8 @@ re-measured if it changed, or a column the database owns:
 |---|---|---|
 | `RRF_K` | `store.rs` | 60 — from the RRF paper |
 | `EXCLUDE_GLOBS` | `store.rs` | Templates, `.obsidian`, attachments, sync conflicts |
-| `EMBEDDING_MODEL` | `embedder.rs` | `nomic-embed-text` — half the index fingerprint |
+| `EMBEDDING_MODEL` | `embedder.rs` | `bge-small-en-v1.5` — part of the index fingerprint |
+| `EMBEDDING_DIM` | `embedder.rs` | 384 — the `vec0` width, also in the fingerprint |
 | `RERANK_CANDIDATES` | `search.rs` | 20 — what fits in one rerank prompt |
 | `DEFAULT_HALF_LIFE_DAYS` | `search.rs` | 90 |
 | `RERANK_MODEL` | `reranker.rs` | `haiku` |
@@ -225,8 +238,11 @@ re-measured if it changed, or a column the database owns:
 | `ORPHAN_EXCLUDE` | `lint.rs` | daily notes, journals, session logs |
 
 Two environment variables change behaviour: `RECALL_DB_PATH` (also what makes
-the test suite hermetic) and `RECALL_OLLAMA_URL` (a remote GPU box is the one
-plausible second value). `RUST_LOG` filters tracing to stderr, default `warn`,
+the test suite hermetic) and `RECALL_MODEL_PATH` (a directory of pinned model
+weights — the seam the Nix build uses to keep the binary offline: `nix/model.nix`
+stages the three files in the store and the wrapper `--set-default`s this at
+them, so an explicit export still wins).
+`RUST_LOG` filters tracing to stderr, default `warn`,
 and `RECALL_UPDATE_SNAPSHOTS` is test-only. `--limit` defaults to 5 at the clap
 layer, and the MCP `limit` argument defaults to 5 in `tool_search`.
 

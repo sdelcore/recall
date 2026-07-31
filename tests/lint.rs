@@ -1,5 +1,5 @@
 //! `recall lint` e2e tests. Filesystem-only — lint never reads the index, so
-//! these tests never index anything and never need Ollama.
+//! these tests never index anything and never load the embedding model.
 
 mod common;
 

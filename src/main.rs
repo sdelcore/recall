@@ -218,7 +218,7 @@ async fn main() -> Result<()> {
         Commands::Collection { action } => run_collection(action),
         Commands::Maintenance { action } => run_maintenance(action),
         Commands::Lint { collection, json } => run_lint(collection, json),
-        Commands::Embed => run_embed().await,
+        Commands::Embed => run_embed(),
         Commands::Status { json } => run_status(json).await,
         Commands::Watch => run_watch(),
         Commands::Serve => mcp::serve_mcp().await,
@@ -560,23 +560,13 @@ fn run_watch() -> Result<()> {
     watcher::watch_directories()
 }
 
-async fn run_embed() -> Result<()> {
+/// How many chunks go through the model in one forward pass. The batch is
+/// where the throughput is; 32 keeps the padded activations small enough to
+/// stay comfortable on a laptop.
+const EMBED_BATCH: usize = 32;
+
+fn run_embed() -> Result<()> {
     let store = store::Store::open()?;
-    let embedder = embedder::Embedder::new();
-
-    // Check Ollama connectivity
-    println!("Checking Ollama connectivity at {}...", embedder.url());
-    if !embedder.health_check().await? {
-        anyhow::bail!(
-            "Cannot connect to Ollama at {}. Is it running? \
-             Set RECALL_OLLAMA_URL if it lives elsewhere.",
-            embedder.url()
-        );
-    }
-    println!("Ollama is available.");
-
-    // Ensure model is pulled
-    embedder.ensure_model().await?;
 
     // Chunks that need embeddings. Embedding is always incremental: a chunk's
     // vector cannot go stale without the chunk itself being rewritten, and a
@@ -589,35 +579,45 @@ async fn run_embed() -> Result<()> {
         return Ok(());
     }
 
+    // Loading the model costs about 0.6s, so it happens once, here, and never
+    // inside the loop.
+    let embedder = embedder::Embedder::load()?;
     println!(
-        "Generating embeddings for {} chunks using {}...\n",
+        "Generating embeddings for {} chunks using {} from {}...\n",
         total,
-        embedder::EMBEDDING_MODEL
+        embedder::EMBEDDING_MODEL,
+        embedder.source()
     );
 
     let mut success_count = 0;
     let mut error_count = 0;
 
-    for (i, (chunk_id, content)) in chunks.iter().enumerate() {
-        // Progress indicator
-        print!("\r[{}/{}] Embedding chunk {}...", i + 1, total, chunk_id);
+    for (done, batch) in chunks.chunks(EMBED_BATCH).enumerate() {
+        let first = done * EMBED_BATCH + 1;
+        print!("\r[{}/{}] Embedding...", first + batch.len() - 1, total);
         std::io::Write::flush(&mut std::io::stdout())?;
 
-        match embedder.embed(content).await {
-            Ok(embedding) => {
-                if let Err(e) = store.store_embedding(*chunk_id, &embedding) {
-                    eprintln!("\nFailed to store embedding for chunk {}: {}", chunk_id, e);
-                    error_count += 1;
-                } else {
-                    success_count += 1;
-                }
-            }
+        let texts: Vec<&str> = batch.iter().map(|(_, content)| content.as_str()).collect();
+        let embeddings = match embedder.embed_batch(&texts) {
+            Ok(embeddings) => embeddings,
             Err(e) => {
                 eprintln!(
-                    "\nFailed to generate embedding for chunk {}: {}",
-                    chunk_id, e
+                    "\nFailed to embed chunks {}..{}: {}",
+                    first,
+                    first + batch.len() - 1,
+                    e
                 );
+                error_count += batch.len();
+                continue;
+            }
+        };
+
+        for ((chunk_id, _), embedding) in batch.iter().zip(embeddings) {
+            if let Err(e) = store.store_embedding(*chunk_id, &embedding) {
+                eprintln!("\nFailed to store embedding for chunk {}: {}", chunk_id, e);
                 error_count += 1;
+            } else {
+                success_count += 1;
             }
         }
     }

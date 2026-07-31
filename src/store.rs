@@ -126,8 +126,12 @@ pub struct Store {
 /// file, so it lives with the code that would be re-measured.
 const RRF_K: f64 = 60.0;
 
-/// Bump when the `chunks` / `files` / `collections` DDL changes.
-const SCHEMA_VERSION: u32 = 3;
+/// Bump when the `chunks` / `files` / `collections` DDL changes, or when the
+/// embedding pipeline changes in a way `EMBEDDING_MODEL`/`EMBEDDING_DIM` don't
+/// capture on their own (e.g. pooling strategy, query instruction prefix) —
+/// same model name and width, but every stored vector is now incomparable
+/// with a freshly embedded one.
+const SCHEMA_VERSION: u32 = 5;
 /// Bump when the chunker's output would differ for unchanged input
 /// (block splitting, size cap, metadata extraction).
 const CHUNKER_VERSION: u32 = 3;
@@ -137,11 +141,14 @@ const FINGERPRINT_KEY: &str = "index_fingerprint";
 /// Identity of the pipeline that produced the stored chunks and embeddings.
 /// A mismatch means the index on disk was built by different code (or against
 /// a different embedding model) and cannot be mixed with new rows, so it is
-/// cold-rebuilt. The embedding model is in the fingerprint because vectors from
-/// two models are not comparable even at equal dimensions.
+/// cold-rebuilt. Both halves of the embedding identity are here: the model,
+/// because vectors from two models are not comparable even at equal width, and
+/// the width, because `vec_embeddings` is declared with it and a stored row of
+/// the wrong length cannot be read back at all.
 fn index_fingerprint() -> String {
     let model = crate::embedder::EMBEDDING_MODEL;
-    format!("schema={SCHEMA_VERSION};chunker={CHUNKER_VERSION};embedding={model}")
+    let dim = crate::embedder::EMBEDDING_DIM;
+    format!("schema={SCHEMA_VERSION};chunker={CHUNKER_VERSION};embedding={model};dim={dim}")
 }
 
 /// Register sqlite-vec extension (must be called before opening any connection)
@@ -346,10 +353,14 @@ impl Store {
         ).unwrap_or(false);
 
         if !has_vec_table {
+            // The width comes from the embedder so there is exactly one place
+            // that knows it; the fingerprint carries it too, so a changed
+            // width cold-rebuilds rather than colliding with this DDL.
             self.conn
-                .execute_batch(
-                    "CREATE VIRTUAL TABLE vec_embeddings USING vec0(embedding float[768]);",
-                )
+                .execute_batch(&format!(
+                    "CREATE VIRTUAL TABLE vec_embeddings USING vec0(embedding float[{}]);",
+                    crate::embedder::EMBEDDING_DIM
+                ))
                 .context("Failed to create vec_embeddings table")?;
         }
 
@@ -1119,7 +1130,7 @@ fn append_filters(
 /// The hyphen is dropped too, which is less obvious. FTS5 reads `a-b` as
 /// the column filter `a` applied to `-b` and fails the whole query with
 /// `no such column: b`, so any hyphenated term ("half-life",
-/// "nomic-embed-text") aborted the search instead of matching. Splitting on
+/// "bge-small-en") aborted the search instead of matching. Splitting on
 /// the hyphen also matches how unicode61 tokenized the document text in the
 /// first place, so the two terms are exactly what is in the index.
 fn sanitize_fts_query(query: &str) -> String {
@@ -1156,7 +1167,7 @@ mod tests {
         let collection = store.create_collection("t", &root).unwrap();
         store.index(collection.id, &root).unwrap();
 
-        let embedding = vec![0.1f32; 768];
+        let embedding = vec![0.1f32; crate::embedder::EMBEDDING_DIM];
         for (chunk_id, _) in store.get_chunks_without_embeddings().unwrap() {
             store.store_embedding(chunk_id, &embedding).unwrap();
         }
@@ -1323,11 +1334,11 @@ mod tests {
 
     #[test]
     fn sanitize_splits_hyphenated_terms() {
-        // FTS5 read `nomic-embed-text` as a column filter and aborted the
-        // query with `no such column: embed`.
+        // FTS5 read `bge-small-en` as a column filter and aborted the
+        // query with `no such column: small`.
         assert_eq!(
-            sanitize_fts_query("nomic-embed-text"),
-            "nomic embed text".to_string()
+            sanitize_fts_query("bge-small-en"),
+            "bge small en".to_string()
         );
         assert_eq!(sanitize_fts_query("half-life decay"), "half life decay");
     }

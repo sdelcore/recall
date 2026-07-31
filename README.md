@@ -5,8 +5,8 @@ A semantic memory search CLI that indexes markdown files (primarily Obsidian vau
 ## Features
 
 - **SQLite + FTS5** - BM25 keyword search with full-text indexing
-- **Vector Embeddings** - Optional semantic search via Ollama
-- **Hybrid Search** - Combine BM25 + vector with Reciprocal Rank Fusion
+- **Vector Embeddings** - `BAAI/bge-small-en-v1.5`, 384 dimensions, computed in-process on the CPU. No service, no network at runtime
+- **Hybrid Search** - Combine BM25 + vector with Reciprocal Rank Fusion. Works on any host; nothing to install or run alongside it
 - **Recency Decay** - Per-collection half-life on the final score, always on
 - **LLM Reranking** - Opt-in with `--rerank`; errors out rather than degrading
 - **Vault Linting** - Dangling wikilinks and orphaned notes, warn-only
@@ -24,9 +24,10 @@ nix develop
 # Build
 cargo build
 
-# Register a collection, then index it
+# Register a collection, index it, then embed it
 recall collection add ~/Obsidian --name vault
 recall index
+recall embed
 
 # Search
 recall search "what are the user's preferences"
@@ -34,6 +35,10 @@ recall search "what are the user's preferences"
 # Check status
 recall status
 ```
+
+`recall embed` needs nothing running: the model is loaded into the process and
+runs on the CPU. Search works after `recall index` alone, but it is keyword-only
+until `recall embed` has filled in the vectors.
 
 ## CLI Commands
 
@@ -43,6 +48,10 @@ Search is always hybrid (BM25 + vector), and always degrades to BM25 alone
 when nothing is embedded yet. There is no retrieval-strategy flag: the fusion
 is strictly better when vectors exist, and only the index knows whether they
 do. A query naming a year sets `--after` from it automatically.
+
+The vector half has no external dependency — the query is embedded in-process,
+so hybrid search behaves the same on every host. BM25-only means one thing:
+`recall embed` has not run on this index yet.
 
 ```bash
 recall search "project deadlines" --limit 10
@@ -95,9 +104,11 @@ watcher never prunes. It re-indexes files that change and skips events whose
 path is gone, so a deleted note leaves the index only on the next
 `recall index`.
 
-A schema or chunker change invalidates the index. There is no migration code:
-recall drops the indexed rows and the next `recall index` (plus `recall embed`)
-rebuilds them. Registered collections survive.
+A schema, chunker, or embedding change invalidates the index — the model name
+and the vector width are both in the fingerprint. There is no migration code:
+recall drops the indexed rows and the next `recall index` **plus**
+`recall embed` rebuilds them. Re-embedding is the slow half. Registered
+collections survive.
 
 ### Collections
 
@@ -125,8 +136,20 @@ exist — a typo is a typo, not a collection that silently indexes nothing.
 recall embed                  # Embed every chunk that has no vector yet
 ```
 
+Embeddings run **in-process on the CPU** — `BAAI/bge-small-en-v1.5`, 384
+dimensions, through candle. There is no service to start and no network call at
+runtime. The model loads once per run (~0.6s) and then embeds roughly 9
+chunks/sec, in batches of 32 — so a 10,000-chunk vault takes about 20 minutes,
+once.
+
+Weights come from `RECALL_MODEL_PATH` if it is set, otherwise from the Hugging
+Face cache — which downloads them on first use. The Nix package pins them into
+the store and sets the variable, so a packaged binary never reaches the network.
+
 Embedding is always incremental. A vector cannot go stale without its chunk
-being rewritten, and a rewrite drops the old row.
+being rewritten, and a rewrite drops the old row. Changing the model or its
+dimension changes the index fingerprint, which drops every chunk and vector: a
+full `recall index` plus a full `recall embed`.
 
 ### File Watching
 
@@ -280,8 +303,7 @@ database owns:
 | `[index] exclude`, `[watch] exclude` | `EXCLUDE_GLOBS` in `store.rs`, one list for the indexer, the linter, and the watcher |
 | `[search] default_limit` | `--limit`, default 5 |
 | `[search] rrf_k` | `RRF_K` in `store.rs` — the constant from the RRF paper |
-| `[embeddings] model` | `EMBEDDING_MODEL` in `embedder.rs` — it is half the index fingerprint, so changing it rebuilds the index |
-| `[embeddings] ollama_url` | `RECALL_OLLAMA_URL`, default `http://localhost:11434` |
+| `[embeddings] model` | `EMBEDDING_MODEL` / `EMBEDDING_DIM` in `embedder.rs` — both are in the index fingerprint, so changing either rebuilds the index |
 | `[reranking] candidates` | `RERANK_CANDIDATES` in `search.rs` |
 | `[reranking] enabled`, `provider`, `top_k` | `--rerank`, and one adapter |
 | `[reranking.claude_code] model` | `RERANK_MODEL` in `reranker.rs` |
@@ -293,15 +315,12 @@ The file never existed on the machine this tool runs on, so every one of those
 keys had only ever held its compiled-in default. A knob nobody turns is not
 flexibility; it is a second place for the answer to live.
 
-The one genuine second value is a remote Ollama box, so that one is an
-environment variable.
-
 ## Environment
 
 | Variable | Purpose |
 |---|---|
 | `RECALL_DB_PATH` | Database location. Default `~/.local/share/recall/memory.sqlite` |
-| `RECALL_OLLAMA_URL` | Ollama server. Default `http://localhost:11434` |
+| `RECALL_MODEL_PATH` | Directory holding `config.json`, `tokenizer.json`, `model.safetensors`. Set it and the binary never touches the network; unset, the weights come from the hf-hub cache. The Nix package sets it for you |
 | `RUST_LOG` | Tracing filter. Default `warn`, to stderr |
 
 ## Storage
@@ -345,12 +364,17 @@ systemctl --user restart recall
          ▼          ▼            ▼
    ┌─────────────────────────┐       ┌──────────┐
    │          store          │◄──────┤ embedder │
-   │  SQLite + FTS5 + vec0   │       │ (Ollama) │
+   │  SQLite + FTS5 + vec0   │       │ (candle) │
    └─────────────────────────┘       └──────────┘
 ```
 
 The CLI and the MCP server are two front ends over one pipeline. Both build the
 same `SearchRequest`, so an identical query ranks identically in either.
+
+`embedder` is a library, not a client: candle runs the BERT weights inside the
+recall process, so the box has no arrow leaving the diagram. Once the weights
+are on disk, every part of the system except `--rerank` (which calls an LLM)
+works offline.
 
 `lint` is the exception: it reads the filesystem rather than the index, and
 asks the store only for the collection roots.
@@ -365,6 +389,15 @@ nix build
 cargo build --release
 ```
 
+The Nix package pins the model weights into the store (`nix/model.nix`, at a
+fixed Hugging Face revision) and wraps the binary so `RECALL_MODEL_PATH` points
+at them. That adds ~128 MiB to the closure and buys a binary that embeds on a
+host with no network. The wrapper uses `--set-default`, so exporting
+`RECALL_MODEL_PATH` yourself still wins.
+
+A Cargo build has no such default: it downloads the weights into the hf-hub
+cache on first embed unless you set `RECALL_MODEL_PATH` yourself.
+
 ## Testing
 
 ```bash
@@ -373,7 +406,7 @@ cargo test
 
 The suite is hermetic — every test drives the CLI with `RECALL_DB_PATH`
 pointed at a temp dir, so it never reads your real
-index or vault. Nothing needs Ollama; retrieval tests are BM25-only.
+index or vault. Nothing downloads model weights; retrieval tests are BM25-only.
 
 `tests/ranking.rs` guards ranking itself. It indexes a fixed 14-note fixture
 vault and runs 24 queries, comparing the ranked results against

@@ -53,9 +53,7 @@ let
         done
   '';
 
-  envVars =
-    { RECALL_DB_PATH = cfg.dbPath; }
-    // lib.optionalAttrs (cfg.ollamaUrl != null) { RECALL_OLLAMA_URL = cfg.ollamaUrl; };
+  envVars = { RECALL_DB_PATH = cfg.dbPath; };
 
 in
 {
@@ -78,19 +76,6 @@ in
 
         A schema or chunker change recreates this file from scratch — recall
         carries no migration code by design.
-      '';
-    };
-
-    ollamaUrl = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      example = "http://localhost:11434";
-      description = ''
-        Ollama endpoint for embeddings, exported as `RECALL_OLLAMA_URL`.
-
-        Leave null on hosts without Ollama. Search still works: recall falls
-        back to BM25 when the index holds no embeddings, and reports the
-        degraded mode in its MCP server instructions.
       '';
     };
 
