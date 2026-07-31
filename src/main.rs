@@ -1,11 +1,14 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 mod ast;
 mod chunker;
 mod config;
 mod embedder;
+mod frontmatter;
 mod intent;
+mod lint;
 mod mcp;
 mod reranker;
 mod search;
@@ -45,6 +48,10 @@ enum Commands {
         /// Only include results after this date (YYYY-MM-DD)
         #[arg(long)]
         after: Option<String>,
+
+        /// Only include results before this date (YYYY-MM-DD)
+        #[arg(long)]
+        before: Option<String>,
 
         /// Filter by project name
         #[arg(long)]
@@ -131,6 +138,41 @@ enum Commands {
         action: Option<MaintenanceAction>,
     },
 
+    /// Check vault links: dangling wikilinks and orphaned notes
+    #[command(
+        long_about = "Check vault links: dangling wikilinks and orphaned notes.\n\n\
+        A link resolves in one of three ways: `resolved-local` (target is in the same \
+        collection), `resolved-foreign` (target is in another registered collection — \
+        cross-project links are valid and are only listed for visibility), or \
+        `unresolved` (target found nowhere). Only unresolved links are findings.\n\n\
+        An ORPHAN is a note with zero incoming AND zero outgoing wikilinks. Notes \
+        matching the `[lint] orphan_exclude` globs (daily notes and session logs by \
+        default) are never reported as orphans.\n\n\
+        Links inside fenced code blocks, inline code, and %%Obsidian comments%% are \
+        ignored. Resolution matches note basenames and frontmatter `aliases:`.\n\n\
+        Warn-only: lint reads the filesystem, changes nothing, never runs as part of \
+        indexing, and exits 0 unless --fail-on-unresolved is passed."
+    )]
+    Lint {
+        /// Restrict findings to a single collection by name
+        #[arg(long)]
+        collection: Option<String>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Write the report to a file instead of stdout. The path must be
+        /// outside every collection root — a report written into an indexed
+        /// vault gets indexed.
+        #[arg(long)]
+        out: Option<PathBuf>,
+
+        /// Exit 1 when unresolved links are found
+        #[arg(long)]
+        fail_on_unresolved: bool,
+    },
+
     /// Show index status and statistics
     Status {
         /// Output as JSON
@@ -208,6 +250,16 @@ enum CollectionAction {
         /// Name for the collection (must be unique)
         #[arg(long)]
         name: String,
+        /// Recency half-life in days for this collection's results
+        #[arg(long)]
+        half_life_days: Option<f64>,
+    },
+    /// Set or clear a collection's recency half-life (days)
+    HalfLife {
+        /// Collection name
+        collection: String,
+        /// Half-life in days. Omit to clear it.
+        days: Option<f64>,
     },
     /// List all collections
     List {
@@ -239,8 +291,10 @@ async fn main() -> Result<()> {
     if !cli.query.is_empty() {
         let query = cli.query.join(" ");
         return run_search(
-            &config, &query, None, "compact", None, None, None, None, false, false, None, false,
-            false,
+            &config, &query, None, "compact", /* after */ None, /* before */ None,
+            /* project */ None, /* file */ None, /* collection */ None,
+            /* hybrid */ false, /* rerank */ false, /* rerank_provider */ None,
+            /* trace */ false, /* auto */ false,
         )
         .await;
     }
@@ -251,6 +305,7 @@ async fn main() -> Result<()> {
             limit,
             format,
             after,
+            before,
             project,
             file,
             collection,
@@ -266,6 +321,7 @@ async fn main() -> Result<()> {
                 limit,
                 &format,
                 after,
+                before,
                 project,
                 file,
                 collection,
@@ -286,6 +342,12 @@ async fn main() -> Result<()> {
         Some(Commands::Collection { action }) => run_collection(action),
         Some(Commands::Context { action }) => run_context(action),
         Some(Commands::Maintenance { action }) => run_maintenance(action),
+        Some(Commands::Lint {
+            collection,
+            json,
+            out,
+            fail_on_unresolved,
+        }) => run_lint(&config, collection, json, out, fail_on_unresolved),
         Some(Commands::Embed { incremental, limit }) => {
             run_embed(&config, incremental, limit).await
         }
@@ -314,6 +376,7 @@ async fn run_search(
     limit: Option<usize>,
     format: &str,
     after: Option<String>,
+    before: Option<String>,
     project: Option<String>,
     file: Option<String>,
     collection: Option<String>,
@@ -330,6 +393,7 @@ async fn run_search(
             limit: limit.unwrap_or(config.search.default_limit),
             collection,
             after,
+            before,
             project,
             file_pattern: file,
             hybrid,
@@ -358,8 +422,10 @@ async fn run_search(
                         "score": r.score,
                         "snippet": r.content,
                         "date": r.date,
+                        "date_source": r.date_source,
                         "section": r.section,
                         "memory_type": r.memory_type,
+                        "status": r.status,
                         "collection": {
                             "name": r.collection_name,
                             "description": r.collection_description,
@@ -371,6 +437,8 @@ async fn run_search(
                             "vec_rank": t.vec_rank,
                             "rrf_score": t.rrf_score,
                             "rerank_score": t.rerank_score,
+                            "decay_factor": t.decay_factor,
+                            "pre_decay_score": t.pre_decay_score,
                         });
                     }
                     obj
@@ -506,15 +574,33 @@ async fn run_index(
 fn run_collection(action: CollectionAction) -> Result<()> {
     let store = store::Store::open()?;
     match action {
-        CollectionAction::Add { path, name } => {
+        CollectionAction::Add {
+            path,
+            name,
+            half_life_days,
+        } => {
             let abs = config::expand_home(&path);
             let canon = std::path::Path::new(&abs)
                 .canonicalize()
                 .unwrap_or_else(|_| std::path::PathBuf::from(&abs))
                 .to_string_lossy()
                 .to_string();
-            let c = store.create_collection(&name, &canon)?;
+            let c = store.create_collection(&name, &canon, half_life_days)?;
             println!("Added collection {:?} → {}", c.name, c.root_path);
+        }
+        CollectionAction::HalfLife { collection, days } => {
+            if let Some(d) = days {
+                if d <= 0.0 {
+                    anyhow::bail!("Half-life must be positive (got {})", d);
+                }
+            }
+            if !store.set_collection_half_life(&collection, days)? {
+                anyhow::bail!("Collection {:?} not found", collection);
+            }
+            match days {
+                Some(d) => println!("Set half-life for {:?} to {} days", collection, d),
+                None => println!("Cleared half-life for {:?}", collection),
+            }
         }
         CollectionAction::List { json } => {
             let cs = store.list_collections()?;
@@ -526,7 +612,11 @@ fn run_collection(action: CollectionAction) -> Result<()> {
                 );
             } else {
                 for c in cs {
-                    println!("{:<20} {}", c.name, c.root_path);
+                    let half_life = match c.half_life_days {
+                        Some(d) => format!("{}d", d),
+                        None => "-".to_string(),
+                    };
+                    println!("{:<20} {:<8} {}", c.name, half_life, c.root_path);
                 }
             }
         }
@@ -643,6 +733,123 @@ fn run_maintenance(action: Option<MaintenanceAction>) -> Result<()> {
     Ok(())
 }
 
+/// Warn-only vault link check. Every collection is scanned so a link can be
+/// resolved across collections; `collection` only narrows what is reported.
+fn run_lint(
+    config: &Config,
+    collection: Option<String>,
+    json: bool,
+    out: Option<PathBuf>,
+    fail_on_unresolved: bool,
+) -> Result<()> {
+    let store = store::Store::open()?;
+    let collections = store.list_collections()?;
+    if collections.is_empty() {
+        anyhow::bail!(
+            "No collections registered. Add one with \
+             `recall collection add <path> --name <name>` and re-run."
+        );
+    }
+    if let Some(name) = collection.as_deref() {
+        if !collections.iter().any(|c| c.name == name) {
+            anyhow::bail!("Collection {:?} not found", name);
+        }
+    }
+
+    let report = lint::lint(config, &collections, collection.as_deref())?;
+    let rendered = if json {
+        format!("{}\n", serde_json::to_string_pretty(&report)?)
+    } else {
+        render_lint(&report)
+    };
+
+    match out {
+        Some(path) => {
+            let written = write_lint_report(&path, &collections, &rendered)?;
+            println!("Wrote lint report to {}", written.display());
+        }
+        None => print!("{}", rendered),
+    }
+
+    if fail_on_unresolved && !report.unresolved.is_empty() {
+        anyhow::bail!("{} unresolved link(s)", report.unresolved.len());
+    }
+    Ok(())
+}
+
+fn render_lint(report: &lint::LintReport) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = writeln!(s, "Recall Lint");
+    let _ = writeln!(s, "===========");
+    let _ = writeln!(s, "Notes scanned:       {}", report.notes_scanned);
+    let _ = writeln!(s, "Links:               {}", report.links_total);
+    let _ = writeln!(s, "  resolved-local:    {}", report.resolved_local);
+    let _ = writeln!(s, "  resolved-foreign:  {}", report.foreign.len());
+    let _ = writeln!(s, "  unresolved:        {}", report.unresolved.len());
+    let _ = writeln!(s, "Orphans:             {}", report.orphans.len());
+
+    if !report.unresolved.is_empty() {
+        let _ = writeln!(s, "\nUnresolved links:");
+        for link in &report.unresolved {
+            let _ = writeln!(s, "  {}:{}  [[{}]]", link.file, link.line, link.target);
+        }
+    }
+    if !report.foreign.is_empty() {
+        let _ = writeln!(s, "\nCross-collection links (valid):");
+        for link in &report.foreign {
+            let _ = writeln!(
+                s,
+                "  {}:{}  [[{}]] → collection {:?}",
+                link.file,
+                link.line,
+                link.target,
+                link.resolved_in.as_deref().unwrap_or("?")
+            );
+        }
+    }
+    if !report.orphans.is_empty() {
+        let _ = writeln!(s, "\nOrphans (no incoming and no outgoing links):");
+        for path in &report.orphans {
+            let _ = writeln!(s, "  {}", path);
+        }
+    }
+    s
+}
+
+/// Write the report, refusing any destination inside a collection root. A big
+/// report dropped into an indexed vault gets indexed on the next run — and in
+/// one case froze Obsidian.
+fn write_lint_report(
+    path: &std::path::Path,
+    collections: &[store::Collection],
+    body: &str,
+) -> Result<PathBuf> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("--out needs a file path, got {}", path.display()))?;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::env::current_dir()?,
+    };
+    let parent = parent.canonicalize().map_err(|e| {
+        anyhow::anyhow!("--out directory {} is not usable: {}", parent.display(), e)
+    })?;
+    for c in collections {
+        if !c.root_path.is_empty() && parent.starts_with(&c.root_path) {
+            anyhow::bail!(
+                "Refusing to write the report into collection {:?} ({}). \
+                 Pick a path outside every collection root.",
+                c.name,
+                c.root_path
+            );
+        }
+    }
+    let dest = parent.join(name);
+    std::fs::write(&dest, body)?;
+    Ok(dest)
+}
+
 async fn run_status(json: bool) -> Result<()> {
     let store = store::Store::open()?;
     let config = Config::load()?;
@@ -712,6 +919,17 @@ fn run_config(config: &Config, action: ConfigAction) -> Result<()> {
             println!("[search]");
             println!("default_limit = {}", config.search.default_limit);
             println!("rrf_k = {}", config.search.rrf_k);
+            println!();
+            println!("[decay]");
+            println!("enabled = {}", config.decay.enabled);
+            println!(
+                "default_half_life_days = {}",
+                config.decay.default_half_life_days
+            );
+            println!("(per-collection half-life: `recall collection half-life <name> <days>`)");
+            println!();
+            println!("[lint]");
+            println!("orphan_exclude = {:?}", config.lint.orphan_exclude);
             println!();
             println!("[watch]");
             println!("paths = {:?}", config.watch.paths);

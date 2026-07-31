@@ -526,9 +526,11 @@ mod tests {
             content: content.into(),
             score,
             date: None,
+            date_source: None,
             section: None,
             project: None,
             memory_type: None,
+            status: None,
             collection_name: None,
             collection_description: None,
         }

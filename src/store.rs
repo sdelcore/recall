@@ -15,9 +15,15 @@ pub struct SearchResult {
     pub content: String,
     pub score: f64,
     pub date: Option<String>,
+    /// Which rung of the chunker's date cascade produced `date`:
+    /// `"frontmatter"`, `"filename"`, or `"mtime"`. Lets a consumer weigh a
+    /// declared date differently from a filesystem timestamp.
+    pub date_source: Option<String>,
     pub section: Option<String>,
     pub project: Option<String>,
     pub memory_type: Option<String>,
+    /// Frontmatter `status:`. Reported, never filtered on.
+    pub status: Option<String>,
     /// Name of the collection that owns this chunk (None when constructed
     /// outside of a DB query, e.g. in a reranker test).
     pub collection_name: Option<String>,
@@ -38,10 +44,26 @@ pub struct StoreStats {
 #[derive(Default)]
 pub struct SearchOptions {
     pub after: Option<String>,
+    /// Upper bound on `chunks.date` (inclusive). Together with `after` this
+    /// bounds a window; alone it answers "what did I know before X".
+    pub before: Option<String>,
     pub project: Option<String>,
     pub file_pattern: Option<String>,
     /// Restrict results to a single collection (None = all collections)
     pub collection_id: Option<i64>,
+}
+
+impl SearchOptions {
+    /// True when at least one predicate is set. Kept next to
+    /// [`append_filters`] because the two must agree: a caller that skips the
+    /// filtering path on a stale field list silently drops a predicate.
+    fn is_filtered(&self) -> bool {
+        self.after.is_some()
+            || self.before.is_some()
+            || self.project.is_some()
+            || self.file_pattern.is_some()
+            || self.collection_id.is_some()
+    }
 }
 
 /// A named collection: a root path that owns a set of indexed files.
@@ -53,6 +75,10 @@ pub struct Collection {
     pub name: String,
     pub root_path: String,
     pub description: Option<String>,
+    /// Recency half-life in days for this collection's chunks. Per-collection
+    /// because corpora age at wildly different rates — a half-life tuned for a
+    /// daily-notes vault pins an archive to the decay floor, and vice versa.
+    pub half_life_days: Option<f64>,
     pub created_at: i64,
 }
 
@@ -64,12 +90,39 @@ pub struct SearchTrace {
     pub vec_rank: Option<usize>,
     pub rrf_score: f64,
     pub rerank_score: Option<f64>,
+    /// Recency factor multiplied into the final score, and the score it was
+    /// multiplied into. Both `None` when decay did not run (disabled, a
+    /// temporal query, or an undated chunk) so `--trace` never implies a
+    /// decay step that never happened.
+    pub decay_factor: Option<f64>,
+    pub pre_decay_score: Option<f64>,
 }
 
 /// SQLite-based memory store with sqlite-vec for vector search
 pub struct Store {
     conn: Connection,
     db_path: PathBuf,
+}
+
+/// Bump when the `chunks` / `files` / `collections` DDL changes.
+const SCHEMA_VERSION: u32 = 2;
+/// Bump when the chunker's output would differ for unchanged input
+/// (block splitting, size cap, metadata extraction).
+const CHUNKER_VERSION: u32 = 2;
+/// `config` key holding the fingerprint of the code that built the index.
+const FINGERPRINT_KEY: &str = "index_fingerprint";
+
+/// Identity of the pipeline that produced the stored chunks and embeddings.
+/// A mismatch means the index on disk was built by different code (or against
+/// a different embedding model) and cannot be mixed with new rows, so it is
+/// cold-rebuilt. The embedding model comes from config because vectors from
+/// two models are not comparable even at equal dimensions.
+fn index_fingerprint() -> String {
+    let model = crate::config::Config::load()
+        .unwrap_or_default()
+        .embeddings
+        .model;
+    format!("schema={SCHEMA_VERSION};chunker={CHUNKER_VERSION};embedding={model}")
 }
 
 /// Register sqlite-vec extension (must be called before opening any connection)
@@ -91,9 +144,14 @@ fn register_sqlite_vec() {
 impl Store {
     /// Open or create the memory store
     pub fn open() -> Result<Self> {
-        register_sqlite_vec();
+        Self::open_at(Self::default_path()?)
+    }
 
-        let db_path = Self::default_path()?;
+    /// Open or create a store at an explicit path. `open` derives the path
+    /// from the environment; tests need to vary it per-case without racing
+    /// on a process-wide env var.
+    fn open_at(db_path: PathBuf) -> Result<Self> {
+        register_sqlite_vec();
 
         // Ensure parent directory exists
         if let Some(parent) = db_path.parent() {
@@ -113,7 +171,8 @@ impl Store {
     }
 
     /// Refuse to operate on a pre-collections DB so we never silently
-    /// double-index or corrupt rows. No fallback by design.
+    /// double-index or corrupt rows. No fallback by design. Then reconcile the
+    /// index fingerprint, cold-rebuilding when the pipeline has changed.
     fn check_schema_compat(&self) -> Result<()> {
         let chunks_exists: bool = self
             .conn
@@ -124,14 +183,14 @@ impl Store {
             )
             .unwrap_or(false);
         if !chunks_exists {
-            return Ok(());
+            return self.check_index_fingerprint();
         }
         let has_col = self
             .conn
             .prepare("SELECT collection_id FROM chunks LIMIT 0")
             .is_ok();
         if has_col {
-            return Ok(());
+            return self.check_index_fingerprint();
         }
         let chunk_count: i64 = self
             .conn
@@ -149,6 +208,53 @@ impl Store {
         // Empty old schema — drop so init_schema can recreate with new columns.
         self.conn
             .execute_batch("DROP TABLE IF EXISTS chunks; DROP TABLE IF EXISTS files;")?;
+        self.check_index_fingerprint()
+    }
+
+    /// Drop the indexed data when [`index_fingerprint`] no longer matches what
+    /// built it. Collections (a user's own configuration) survive; files,
+    /// chunks, FTS and embeddings are recreated empty by `init_schema`, so the
+    /// next `recall index` re-indexes everything from scratch.
+    fn check_index_fingerprint(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )?;
+        let current = index_fingerprint();
+        let stored: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM config WHERE key = ?1",
+                params![FINGERPRINT_KEY],
+                |row| row.get(0),
+            )
+            .ok();
+        if stored.as_deref() == Some(current.as_str()) {
+            return Ok(());
+        }
+
+        let chunk_count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
+            .unwrap_or(0);
+        if chunk_count > 0 {
+            eprintln!(
+                "Index fingerprint changed ({} -> {}): discarding {} chunks. \
+                 Run `recall index` (and `recall embed`) to rebuild.",
+                stored.as_deref().unwrap_or("none"),
+                current,
+                chunk_count
+            );
+        }
+        self.conn.execute_batch(
+            "DROP TABLE IF EXISTS chunks; \
+             DROP TABLE IF EXISTS files; \
+             DROP TABLE IF EXISTS fts_chunks; \
+             DROP TABLE IF EXISTS vec_embeddings;",
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
+            params![FINGERPRINT_KEY, current],
+        )?;
         Ok(())
     }
 
@@ -176,6 +282,7 @@ impl Store {
                 name TEXT UNIQUE NOT NULL,
                 root_path TEXT NOT NULL,
                 description TEXT,
+                half_life_days REAL,
                 created_at INTEGER NOT NULL
             );
 
@@ -199,9 +306,11 @@ impl Store {
                 collection_id INTEGER NOT NULL,
                 chunk_index INTEGER NOT NULL,
                 date TEXT,
+                date_source TEXT,
                 section TEXT,
                 project TEXT,
                 memory_type TEXT,
+                status TEXT,
                 start_line INTEGER NOT NULL,
                 end_line INTEGER NOT NULL,
                 content TEXT NOT NULL,
@@ -317,9 +426,11 @@ impl Store {
                 c.content,
                 bm25(fts_chunks) as score,
                 c.date,
+                c.date_source,
                 c.section,
                 c.project,
                 c.memory_type,
+                c.status,
                 col.name,
                 col.description
             FROM fts_chunks
@@ -334,31 +445,7 @@ impl Store {
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
             vec![Box::new(sanitize_fts_query(query))];
 
-        // Add date filter
-        if let Some(after) = &options.after {
-            sql.push_str(" AND c.date >= ?");
-            params_vec.push(Box::new(after.clone()));
-        }
-
-        // Add project filter (search in section name)
-        if let Some(project) = &options.project {
-            sql.push_str(" AND c.section LIKE ?");
-            params_vec.push(Box::new(format!("%{}%", project)));
-        }
-
-        // Add file pattern filter
-        if let Some(file_pattern) = &options.file_pattern {
-            sql.push_str(" AND f.file_path LIKE ?");
-            // Convert glob to SQL LIKE pattern
-            let pattern = file_pattern.replace('*', "%").replace('?', "_");
-            params_vec.push(Box::new(pattern));
-        }
-
-        // Add collection filter
-        if let Some(cid) = options.collection_id {
-            sql.push_str(" AND c.collection_id = ?");
-            params_vec.push(Box::new(cid));
-        }
+        append_filters(&mut sql, options, &mut params_vec);
 
         sql.push_str(" ORDER BY score LIMIT ?");
         params_vec.push(Box::new(limit as i64));
@@ -377,11 +464,13 @@ impl Store {
                 content: row.get(3)?,
                 score: row.get::<_, f64>(4)?.abs(), // BM25 returns negative scores
                 date: row.get(5)?,
-                section: row.get(6)?,
-                project: row.get(7)?,
-                memory_type: row.get(8)?,
-                collection_name: row.get(9)?,
-                collection_description: row.get(10)?,
+                date_source: row.get(6)?,
+                section: row.get(7)?,
+                project: row.get(8)?,
+                memory_type: row.get(9)?,
+                status: row.get(10)?,
+                collection_name: row.get(11)?,
+                collection_description: row.get(12)?,
             })
         })?;
 
@@ -393,28 +482,30 @@ impl Store {
         Ok(search_results)
     }
 
-    /// FTS5 search returning chunk IDs in BM25 rank order (for hybrid search)
+    /// FTS5 search returning chunk IDs in BM25 rank order (for hybrid search).
+    /// Applies the same filters as [`Store::search_fts_filtered`] — the
+    /// candidate list, not just the final hydration, must be filtered or the
+    /// fused result set silently comes up short of `limit`.
     fn search_fts_chunk_ids(
         &self,
         query: &str,
         limit: usize,
-        collection_id: Option<i64>,
+        options: &SearchOptions,
     ) -> Result<Vec<i64>> {
         let mut sql = String::from(
             r#"
             SELECT c.id
             FROM fts_chunks
             JOIN chunks c ON c.id = fts_chunks.rowid
-            WHERE fts_chunks MATCH ?1
+            JOIN files f ON f.id = c.file_id
+            WHERE fts_chunks MATCH ?
         "#,
         );
         let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> =
-            vec![Box::new(sanitize_fts_query(query)), Box::new(limit as i64)];
-        if let Some(cid) = collection_id {
-            sql.push_str(" AND c.collection_id = ?3");
-            params_vec.push(Box::new(cid));
-        }
-        sql.push_str(" ORDER BY bm25(fts_chunks) LIMIT ?2");
+            vec![Box::new(sanitize_fts_query(query))];
+        append_filters(&mut sql, options, &mut params_vec);
+        sql.push_str(" ORDER BY bm25(fts_chunks) LIMIT ?");
+        params_vec.push(Box::new(limit as i64));
 
         let mut stmt = self.conn.prepare(&sql)?;
         let params_refs: Vec<&dyn rusqlite::ToSql> =
@@ -472,19 +563,17 @@ impl Store {
     }
 
     /// Vector search using sqlite-vec KNN, returning chunk IDs in rank order.
-    /// When `collection_id` is set, runs KNN larger then filters down so the
-    /// final list still contains `limit` items from the requested collection.
+    /// KNN cannot express the [`SearchOptions`] predicates, so when any filter
+    /// is set we ask for a larger neighbourhood and prune it afterwards —
+    /// still in rank order — until `limit` survivors remain.
     fn search_vector_chunk_ids(
         &self,
         query_embedding: &[f32],
         limit: usize,
-        collection_id: Option<i64>,
+        options: &SearchOptions,
     ) -> Result<Vec<i64>> {
-        let knn_k = if collection_id.is_some() {
-            limit * 4
-        } else {
-            limit
-        };
+        let filtered = options.is_filtered();
+        let knn_k = if filtered { limit * 4 } else { limit };
         let mut stmt = self
             .conn
             .prepare("SELECT rowid FROM vec_embeddings WHERE embedding MATCH ?1 AND k = ?2")?;
@@ -496,62 +585,62 @@ impl Store {
             ids.push(row?);
         }
 
-        if let Some(cid) = collection_id {
-            // Filter to the requested collection without losing rank order.
-            let mut filtered = Vec::with_capacity(limit);
-            let placeholders = (0..ids.len())
-                .map(|i| format!("?{}", i + 2))
-                .collect::<Vec<_>>()
-                .join(",");
-            if ids.is_empty() {
-                return Ok(filtered);
-            }
-            let sql = format!(
-                "SELECT id FROM chunks WHERE collection_id = ?1 AND id IN ({})",
-                placeholders
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(cid)];
-            for id in &ids {
-                params_vec.push(Box::new(*id));
-            }
-            let params_refs: Vec<&dyn rusqlite::ToSql> =
-                params_vec.iter().map(|p| p.as_ref()).collect();
-            let allowed: std::collections::HashSet<i64> = stmt
-                .query_map(params_refs.as_slice(), |row| row.get::<_, i64>(0))?
-                .filter_map(|r| r.ok())
-                .collect();
-            for id in ids {
-                if allowed.contains(&id) {
-                    filtered.push(id);
-                    if filtered.len() == limit {
-                        break;
-                    }
+        if !filtered || ids.is_empty() {
+            return Ok(ids);
+        }
+
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let mut sql = format!(
+            "SELECT c.id FROM chunks c JOIN files f ON f.id = c.file_id \
+             WHERE c.id IN ({placeholders})"
+        );
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = ids
+            .iter()
+            .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>)
+            .collect();
+        append_filters(&mut sql, options, &mut params_vec);
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let allowed: std::collections::HashSet<i64> = stmt
+            .query_map(params_refs.as_slice(), |row| row.get::<_, i64>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut kept = Vec::with_capacity(limit);
+        for id in ids {
+            if allowed.contains(&id) {
+                kept.push(id);
+                if kept.len() == limit {
+                    break;
                 }
             }
-            Ok(filtered)
-        } else {
-            Ok(ids)
         }
+        Ok(kept)
     }
 
     /// Hybrid search combining BM25 and vector search using Reciprocal Rank
     /// Fusion. Returns per-result trace info (BM25 rank, vector rank, fused
     /// RRF score) so callers can render `--trace` output.
+    ///
+    /// `options` is applied to *both* candidate lists before fusion. Filtering
+    /// only the fused output would drop rows that were already counted against
+    /// `limit`, returning fewer results than asked for.
     pub fn search_hybrid_traced(
         &self,
         query: &str,
         query_embedding: &[f32],
         limit: usize,
         rrf_k: u32,
-        collection_id: Option<i64>,
+        options: &SearchOptions,
     ) -> Result<Vec<(SearchResult, SearchTrace)>> {
         let candidate_count = limit * 3;
         let k = rrf_k as f64;
 
-        let bm25_ranked = self.search_fts_chunk_ids(query, candidate_count, collection_id)?;
+        let bm25_ranked = self.search_fts_chunk_ids(query, candidate_count, options)?;
         let vector_ranked =
-            self.search_vector_chunk_ids(query_embedding, candidate_count, collection_id)?;
+            self.search_vector_chunk_ids(query_embedding, candidate_count, options)?;
 
         let bm25_idx: HashMap<i64, usize> = bm25_ranked
             .iter()
@@ -585,6 +674,7 @@ impl Store {
                     vec_rank: vec_idx.get(&chunk_id).copied(),
                     rrf_score,
                     rerank_score: None,
+                    ..Default::default()
                 };
                 out.push((result, trace));
             }
@@ -613,6 +703,7 @@ impl Store {
                     vec_rank: None,
                     rrf_score: 1.0 / (k + rank as f64 + 1.0),
                     rerank_score: None,
+                    ..Default::default()
                 };
                 (r, trace)
             })
@@ -623,8 +714,8 @@ impl Store {
     fn get_chunk_by_id(&self, chunk_id: i64, score: f64) -> Result<Option<SearchResult>> {
         let result = self.conn.query_row(
             r#"SELECT f.file_path, c.start_line, c.end_line, c.content,
-                      c.date, c.section, c.project, c.memory_type,
-                      col.name, col.description
+                      c.date, c.date_source, c.section, c.project,
+                      c.memory_type, c.status, col.name, col.description
                FROM chunks c
                JOIN files f ON f.id = c.file_id
                JOIN collections col ON col.id = c.collection_id
@@ -638,11 +729,13 @@ impl Store {
                     content: row.get(3)?,
                     score,
                     date: row.get(4)?,
-                    section: row.get(5)?,
-                    project: row.get(6)?,
-                    memory_type: row.get(7)?,
-                    collection_name: row.get(8)?,
-                    collection_description: row.get(9)?,
+                    date_source: row.get(5)?,
+                    section: row.get(6)?,
+                    project: row.get(7)?,
+                    memory_type: row.get(8)?,
+                    status: row.get(9)?,
+                    collection_name: row.get(10)?,
+                    collection_description: row.get(11)?,
                 })
             },
         );
@@ -694,7 +787,7 @@ impl Store {
             .as_secs() as i64;
 
         let content = std::fs::read_to_string(path)?;
-        let chunks = crate::chunker::chunk_file(&content, file_path);
+        let chunks = crate::chunker::chunk_file(&content, file_path, mtime);
 
         self.delete_embeddings_for_file(collection_id, file_path)?;
 
@@ -721,19 +814,21 @@ impl Store {
 
         for (i, chunk) in chunks.iter().enumerate() {
             self.conn.execute(
-                r#"INSERT INTO chunks (file_id, collection_id, chunk_index, date, section, project, start_line, end_line, content, memory_type)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"#,
+                r#"INSERT INTO chunks (file_id, collection_id, chunk_index, date, date_source, section, project, start_line, end_line, content, memory_type, status)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
                 params![
                     file_id,
                     collection_id,
                     i as i64,
                     chunk.date,
+                    chunk.date_source,
                     chunk.section,
                     chunk.project,
                     chunk.start_line,
                     chunk.end_line,
                     chunk.content,
                     chunk.memory_type,
+                    chunk.status,
                 ],
             )?;
         }
@@ -818,11 +913,17 @@ impl Store {
 
     // ── Collection CRUD ───────────────────────────────────────────────────
 
-    pub fn create_collection(&self, name: &str, root_path: &str) -> Result<Collection> {
+    pub fn create_collection(
+        &self,
+        name: &str,
+        root_path: &str,
+        half_life_days: Option<f64>,
+    ) -> Result<Collection> {
         let now = Utc::now().timestamp();
         self.conn.execute(
-            "INSERT INTO collections (name, root_path, created_at) VALUES (?1, ?2, ?3)",
-            params![name, root_path, now],
+            "INSERT INTO collections (name, root_path, half_life_days, created_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![name, root_path, half_life_days, now],
         )?;
         let id = self.conn.last_insert_rowid();
         Ok(Collection {
@@ -830,13 +931,15 @@ impl Store {
             name: name.to_string(),
             root_path: root_path.to_string(),
             description: None,
+            half_life_days,
             created_at: now,
         })
     }
 
     pub fn list_collections(&self) -> Result<Vec<Collection>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, root_path, description, created_at FROM collections ORDER BY name",
+            "SELECT id, name, root_path, description, half_life_days, created_at \
+             FROM collections ORDER BY name",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(Collection {
@@ -844,7 +947,8 @@ impl Store {
                 name: row.get(1)?,
                 root_path: row.get(2)?,
                 description: row.get(3)?,
-                created_at: row.get(4)?,
+                half_life_days: row.get(4)?,
+                created_at: row.get(5)?,
             })
         })?;
         let mut out = Vec::new();
@@ -856,7 +960,8 @@ impl Store {
 
     pub fn get_collection(&self, name: &str) -> Result<Option<Collection>> {
         let result = self.conn.query_row(
-            "SELECT id, name, root_path, description, created_at FROM collections WHERE name = ?1",
+            "SELECT id, name, root_path, description, half_life_days, created_at \
+             FROM collections WHERE name = ?1",
             params![name],
             |row| {
                 Ok(Collection {
@@ -864,7 +969,8 @@ impl Store {
                     name: row.get(1)?,
                     root_path: row.get(2)?,
                     description: row.get(3)?,
-                    created_at: row.get(4)?,
+                    half_life_days: row.get(4)?,
+                    created_at: row.get(5)?,
                 })
             },
         );
@@ -885,6 +991,21 @@ impl Store {
         let n = self.conn.execute(
             "UPDATE collections SET description = ?1 WHERE name = ?2",
             params![description, name],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Set or clear a collection's recency half-life (days). `None` clears it,
+    /// so the collection falls back to `config.decay.default_half_life_days`.
+    /// Returns false if no collection by that name exists.
+    pub fn set_collection_half_life(
+        &self,
+        name: &str,
+        half_life_days: Option<f64>,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE collections SET half_life_days = ?1 WHERE name = ?2",
+            params![half_life_days, name],
         )?;
         Ok(n > 0)
     }
@@ -984,16 +1105,60 @@ pub struct OrphanCounts {
     pub embeddings: i64,
 }
 
+/// Append the [`SearchOptions`] predicates to a partially built `WHERE`
+/// clause and push their bound values onto `params`. The caller's query must
+/// already alias `chunks` as `c` and `files` as `f`, and must bind its own
+/// parameters in the same textual order — placeholders are positional.
+///
+/// Shared by every retrieval path (BM25 rows, BM25 candidate IDs, vector
+/// candidate IDs) so a filter cannot apply in one mode and silently vanish in
+/// another.
+fn append_filters(
+    sql: &mut String,
+    options: &SearchOptions,
+    params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+) {
+    if let Some(after) = &options.after {
+        sql.push_str(" AND c.date >= ?");
+        params.push(Box::new(after.clone()));
+    }
+    if let Some(before) = &options.before {
+        sql.push_str(" AND c.date <= ?");
+        params.push(Box::new(before.clone()));
+    }
+    // `--project` matches on the section heading, not `chunks.project`,
+    // which the chunker never populates.
+    if let Some(project) = &options.project {
+        sql.push_str(" AND c.section LIKE ?");
+        params.push(Box::new(format!("%{}%", project)));
+    }
+    if let Some(file_pattern) = &options.file_pattern {
+        sql.push_str(" AND f.file_path LIKE ?");
+        params.push(Box::new(file_pattern.replace('*', "%").replace('?', "_")));
+    }
+    if let Some(cid) = options.collection_id {
+        sql.push_str(" AND c.collection_id = ?");
+        params.push(Box::new(cid));
+    }
+}
+
 /// Sanitize a free-text query into something FTS5 will accept as a MATCH
 /// expression. Drops FTS5 operators (`?`, `:`, `"`, parentheses, etc.) so
 /// natural-language queries from users / classifiers don't blow up with
 /// `fts5: syntax error`. Tokens are rejoined with spaces — FTS5 treats
 /// multiple unquoted tokens as an implicit AND-of-OR over its tokenizer.
+///
+/// The hyphen is dropped too, which is less obvious. FTS5 reads `a-b` as
+/// the column filter `a` applied to `-b` and fails the whole query with
+/// `no such column: b`, so any hyphenated term ("half-life",
+/// "nomic-embed-text") aborted the search instead of matching. Splitting on
+/// the hyphen also matches how unicode61 tokenized the document text in the
+/// first place, so the two terms are exactly what is in the index.
 fn sanitize_fts_query(query: &str) -> String {
     let cleaned: String = query
         .chars()
         .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' || c.is_whitespace() {
+            if c.is_alphanumeric() || c == '_' || c.is_whitespace() {
                 c
             } else {
                 ' '
@@ -1001,4 +1166,126 @@ fn sanitize_fts_query(query: &str) -> String {
         })
         .collect();
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store plus an indexed two-file vault: one note dated 2020, one dated
+    /// 2026, both matching the same query. Every chunk gets the same
+    /// embedding, so the vector list is decided by the KNN tie-break, not by
+    /// content — these tests are about filtering, not about ranking.
+    fn indexed_store() -> (tempfile::TempDir, Store, Vec<f32>) {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = dir.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        std::fs::write(vault.join("2020-01-02.md"), "# Old\n\nquokka zebra\n").unwrap();
+        std::fs::write(vault.join("2026-01-02.md"), "# New\n\nquokka zebra\n").unwrap();
+
+        let store = Store::open_at(dir.path().join("memory.sqlite")).unwrap();
+        let root = vault.to_string_lossy().to_string();
+        let collection = store.create_collection("t", &root, None).unwrap();
+        store.index_full(collection.id, &root).unwrap();
+
+        let embedding = vec![0.1f32; 768];
+        for (chunk_id, _) in store.get_chunks_without_embeddings().unwrap() {
+            store.store_embedding(chunk_id, &embedding).unwrap();
+        }
+        (dir, store, embedding)
+    }
+
+    fn hybrid_paths(store: &Store, embedding: &[f32], options: &SearchOptions) -> Vec<String> {
+        store
+            .search_hybrid_traced("quokka zebra", embedding, 10, 60, options)
+            .unwrap()
+            .into_iter()
+            .map(|(r, _)| r.file_path)
+            .collect()
+    }
+
+    #[test]
+    fn hybrid_search_honors_the_after_filter() {
+        let (_dir, store, embedding) = indexed_store();
+
+        let all = hybrid_paths(&store, &embedding, &SearchOptions::default());
+        assert!(all.iter().any(|p| p.ends_with("2020-01-02.md")));
+        assert!(all.iter().any(|p| p.ends_with("2026-01-02.md")));
+
+        let recent = hybrid_paths(
+            &store,
+            &embedding,
+            &SearchOptions {
+                after: Some("2025-01-01".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(!recent.is_empty());
+        assert!(recent.iter().all(|p| p.ends_with("2026-01-02.md")));
+    }
+
+    /// `before` was added to `append_filters` after the vector path's
+    /// "is anything filtered?" check was written, so a `before`-only search
+    /// skipped the prune entirely and the KNN candidates came back unbounded.
+    #[test]
+    fn hybrid_search_honors_a_lone_before_filter() {
+        let (_dir, store, embedding) = indexed_store();
+
+        let old = hybrid_paths(
+            &store,
+            &embedding,
+            &SearchOptions {
+                before: Some("2025-01-01".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(!old.is_empty());
+        assert!(old.iter().all(|p| p.ends_with("2020-01-02.md")));
+    }
+
+    #[test]
+    fn hybrid_search_honors_the_file_pattern_filter() {
+        let (_dir, store, embedding) = indexed_store();
+
+        let matched = hybrid_paths(
+            &store,
+            &embedding,
+            &SearchOptions {
+                file_pattern: Some("*2020-01-02*".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(!matched.is_empty());
+        assert!(matched.iter().all(|p| p.ends_with("2020-01-02.md")));
+    }
+
+    #[test]
+    fn sanitize_splits_hyphenated_terms() {
+        // FTS5 read `nomic-embed-text` as a column filter and aborted the
+        // query with `no such column: embed`.
+        assert_eq!(
+            sanitize_fts_query("nomic-embed-text"),
+            "nomic embed text".to_string()
+        );
+        assert_eq!(sanitize_fts_query("half-life decay"), "half life decay");
+    }
+
+    #[test]
+    fn sanitize_drops_fts5_operators_but_keeps_words() {
+        assert_eq!(
+            sanitize_fts_query("how does \"RRF\" work?"),
+            "how does RRF work"
+        );
+        assert_eq!(sanitize_fts_query("section: Coffee"), "section Coffee");
+        assert_eq!(sanitize_fts_query("snake_case stays"), "snake_case stays");
+    }
+
+    #[test]
+    fn a_hyphenated_query_returns_results_instead_of_erroring() {
+        let (_dir, store, _embedding) = indexed_store();
+        let results = store
+            .search_fts_filtered("quokka-zebra", 5, &SearchOptions::default())
+            .expect("hyphenated query must not error");
+        assert_eq!(results.len(), 2);
+    }
 }

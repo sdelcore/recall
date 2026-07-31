@@ -1,0 +1,172 @@
+{
+  "baseline": {
+    "batch size": [
+      "sessions/embedding-tuning.md:6"
+    ],
+    "datastore": [
+      "decisions/datastore-mongodb.md:7",
+      "decisions/datastore-postgres.md:7"
+    ],
+    "dentist appointment": [
+      "notes/standup.md:6"
+    ],
+    "deploy": [
+      "decisions/deploy-heroku.md:7",
+      "decisions/deploy-nixos.md:7"
+    ],
+    "deploy target": [
+      "decisions/deploy-heroku.md:7",
+      "decisions/deploy-nixos.md:7"
+    ],
+    "grocery list": [
+      "notes/inbox.md:1"
+    ],
+    "half-life decay": [
+      "projects/recall-overview.md:7"
+    ],
+    "heroku dynos": [
+      "decisions/deploy-heroku.md:7"
+    ],
+    "index": [
+      "sessions/fts-debugging.md:6"
+    ],
+    "mongodb replica": [
+      "decisions/datastore-mongodb.md:7"
+    ],
+    "nixos flake": [
+      "decisions/deploy-nixos.md:7"
+    ],
+    "nomic embed": [
+      "reference/ollama-embeddings.md:6"
+    ],
+    "orchestrator persona": [
+      "projects/aria-overview.md:7"
+    ],
+    "postgres joins": [
+      "decisions/datastore-postgres.md:7"
+    ],
+    "primary datastore": [
+      "decisions/datastore-mongodb.md:7",
+      "decisions/datastore-postgres.md:7"
+    ],
+    "rank": [
+      "reference/rank-fusion.md:6"
+    ],
+    "reciprocal rank fusion": [
+      "reference/rank-fusion.md:6"
+    ],
+    "runs": [
+      "reference/ollama-embeddings.md:6",
+      "decisions/datastore-mongodb.md:7",
+      "decisions/deploy-heroku.md:7"
+    ],
+    "schema": [
+      "decisions/datastore-postgres.md:7"
+    ],
+    "status current": [
+      "reference/ollama-embeddings.md:2",
+      "reference/rank-fusion.md:2",
+      "reference/sqlite-fts5.md:2",
+      "decisions/datastore-postgres.md:2",
+      "decisions/deploy-nixos.md:2"
+    ],
+    "thinkpad dock": [
+      "archive/laptop-setup.md:6"
+    ],
+    "trigger sync": [
+      "sessions/fts-debugging.md:6"
+    ],
+    "unicode61 tokenizer": [
+      "reference/sqlite-fts5.md:6"
+    ],
+    "vault": [
+      "projects/aria-overview.md:7",
+      "projects/recall-overview.md:7"
+    ]
+  },
+  "decay": {
+    "batch size": [
+      "sessions/embedding-tuning.md:6"
+    ],
+    "datastore": [
+      "decisions/datastore-postgres.md:7",
+      "decisions/datastore-mongodb.md:7"
+    ],
+    "dentist appointment": [
+      "notes/standup.md:6"
+    ],
+    "deploy": [
+      "decisions/deploy-nixos.md:7",
+      "decisions/deploy-heroku.md:7"
+    ],
+    "deploy target": [
+      "decisions/deploy-nixos.md:7",
+      "decisions/deploy-heroku.md:7"
+    ],
+    "grocery list": [
+      "notes/inbox.md:1"
+    ],
+    "half-life decay": [
+      "projects/recall-overview.md:7"
+    ],
+    "heroku dynos": [
+      "decisions/deploy-heroku.md:7"
+    ],
+    "index": [
+      "sessions/fts-debugging.md:6"
+    ],
+    "mongodb replica": [
+      "decisions/datastore-mongodb.md:7"
+    ],
+    "nixos flake": [
+      "decisions/deploy-nixos.md:7"
+    ],
+    "nomic embed": [
+      "reference/ollama-embeddings.md:6"
+    ],
+    "orchestrator persona": [
+      "projects/aria-overview.md:7"
+    ],
+    "postgres joins": [
+      "decisions/datastore-postgres.md:7"
+    ],
+    "primary datastore": [
+      "decisions/datastore-postgres.md:7",
+      "decisions/datastore-mongodb.md:7"
+    ],
+    "rank": [
+      "reference/rank-fusion.md:6"
+    ],
+    "reciprocal rank fusion": [
+      "reference/rank-fusion.md:6"
+    ],
+    "runs": [
+      "reference/ollama-embeddings.md:6",
+      "decisions/datastore-mongodb.md:7",
+      "decisions/deploy-heroku.md:7"
+    ],
+    "schema": [
+      "decisions/datastore-postgres.md:7"
+    ],
+    "status current": [
+      "decisions/datastore-postgres.md:2",
+      "decisions/deploy-nixos.md:2",
+      "reference/rank-fusion.md:2",
+      "reference/ollama-embeddings.md:2",
+      "reference/sqlite-fts5.md:2"
+    ],
+    "thinkpad dock": [
+      "archive/laptop-setup.md:6"
+    ],
+    "trigger sync": [
+      "sessions/fts-debugging.md:6"
+    ],
+    "unicode61 tokenizer": [
+      "reference/sqlite-fts5.md:6"
+    ],
+    "vault": [
+      "projects/aria-overview.md:7",
+      "projects/recall-overview.md:7"
+    ]
+  }
+}

@@ -15,6 +15,39 @@ pub struct Config {
     pub watch: WatchConfig,
     #[serde(default)]
     pub reranking: RerankConfig,
+    #[serde(default)]
+    pub decay: DecayConfig,
+    #[serde(default)]
+    pub lint: LintConfig,
+}
+
+/// `recall lint` only. Some notes are never linked by design — daily notes and
+/// session logs — and they outnumber everything else in a real vault, so left
+/// alone they bury the orphan report. They are still scanned for links; they
+/// are only kept out of the orphan list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LintConfig {
+    /// Glob patterns (matched case-insensitively against the absolute path)
+    /// whose notes are never reported as orphans.
+    #[serde(default = "default_orphan_exclude")]
+    pub orphan_exclude: Vec<String>,
+}
+
+/// Recency decay applied to the final score. The per-collection half-life
+/// lives in the database (`collections.half_life_days`), not here — corpora
+/// age at different rates, so one number in the TOML cannot serve them all.
+/// This section only holds the global on/off switch and the fallback used for
+/// a collection that has no half-life of its own.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecayConfig {
+    /// Apply recency decay to search scores.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Half-life in days for collections with no `half_life_days` of their
+    /// own. A collection's own value always wins; this only keeps decay from
+    /// being a no-op on a corpus the user has not tuned yet.
+    #[serde(default = "default_half_life_days")]
+    pub default_half_life_days: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +203,38 @@ fn default_rerank_top_k() -> usize {
 
 fn default_haiku_model() -> String {
     "haiku".to_string()
+}
+
+fn default_half_life_days() -> f64 {
+    90.0
+}
+
+fn default_orphan_exclude() -> Vec<String> {
+    vec![
+        "**/daily/**".to_string(),
+        "**/journal/**".to_string(),
+        "**/sessions/**".to_string(),
+        "**/session-*.md".to_string(),
+        // A `YYYY-MM-DD` stem is a daily note wherever it lives.
+        "**/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*.md".to_string(),
+    ]
+}
+
+impl Default for LintConfig {
+    fn default() -> Self {
+        Self {
+            orphan_exclude: default_orphan_exclude(),
+        }
+    }
+}
+
+impl Default for DecayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_half_life_days: default_half_life_days(),
+        }
+    }
 }
 
 impl Default for RerankConfig {
