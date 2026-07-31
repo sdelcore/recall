@@ -1,10 +1,43 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use rusqlite::{ffi::sqlite3_auto_extension, params, Connection};
+use rusqlite::{ffi::sqlite3_auto_extension, params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use zerocopy::AsBytes;
+
+/// The one list of paths that are not notes.
+///
+/// It used to be three: globs hardcoded in `index_directory`, `[index] exclude`
+/// read only by the linter, and `[watch] exclude` matched as substrings. Three
+/// lists mean the linter can report an orphan the indexer never saw, and the
+/// watcher can index a file `recall index` skips. Every walker over a
+/// collection root goes through [`is_excluded`] instead.
+pub const EXCLUDE_GLOBS: &[&str] = &[
+    "**/Templates/**",
+    "**/.obsidian/**",
+    "**/attachments/**",
+    "**/*.sync-conflict-*",
+];
+
+/// True when `path` matches [`EXCLUDE_GLOBS`]. Case-insensitive, because
+/// `Templates/` and `templates/` are the same folder to the person who wrote
+/// the pattern.
+pub fn is_excluded(path: &str) -> bool {
+    static COMPILED: OnceLock<Vec<glob::Pattern>> = OnceLock::new();
+    let patterns = COMPILED.get_or_init(|| {
+        EXCLUDE_GLOBS
+            .iter()
+            .map(|p| glob::Pattern::new(p).expect("EXCLUDE_GLOBS are compile-time constants"))
+            .collect()
+    });
+    let opts = glob::MatchOptions {
+        case_sensitive: false,
+        ..glob::MatchOptions::new()
+    };
+    patterns.iter().any(|p| p.matches_with(path, opts))
+}
 
 /// Search result from the memory store
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,8 +53,6 @@ pub struct SearchResult {
     /// declared date differently from a filesystem timestamp.
     pub date_source: Option<String>,
     pub section: Option<String>,
-    pub project: Option<String>,
-    pub memory_type: Option<String>,
     /// Frontmatter `status:`. Reported, never filtered on.
     pub status: Option<String>,
     /// Name of the collection that owns this chunk (None when constructed
@@ -47,23 +78,8 @@ pub struct SearchOptions {
     /// Upper bound on `chunks.date` (inclusive). Together with `after` this
     /// bounds a window; alone it answers "what did I know before X".
     pub before: Option<String>,
-    pub project: Option<String>,
-    pub file_pattern: Option<String>,
     /// Restrict results to a single collection (None = all collections)
     pub collection_id: Option<i64>,
-}
-
-impl SearchOptions {
-    /// True when at least one predicate is set. Kept next to
-    /// [`append_filters`] because the two must agree: a caller that skips the
-    /// filtering path on a stale field list silently drops a predicate.
-    fn is_filtered(&self) -> bool {
-        self.after.is_some()
-            || self.before.is_some()
-            || self.project.is_some()
-            || self.file_pattern.is_some()
-            || self.collection_id.is_some()
-    }
 }
 
 /// A named collection: a root path that owns a set of indexed files.
@@ -104,24 +120,27 @@ pub struct Store {
     db_path: PathBuf,
 }
 
+/// Reciprocal Rank Fusion's rank-smoothing constant. 60 is the value from the
+/// RRF paper (Cormack et al. 2009) and the one every implementation ships.
+/// Tuning it needs the labeled query set in `tests/ranking.rs`, not a config
+/// file, so it lives with the code that would be re-measured.
+const RRF_K: f64 = 60.0;
+
 /// Bump when the `chunks` / `files` / `collections` DDL changes.
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 /// Bump when the chunker's output would differ for unchanged input
 /// (block splitting, size cap, metadata extraction).
-const CHUNKER_VERSION: u32 = 2;
+const CHUNKER_VERSION: u32 = 3;
 /// `config` key holding the fingerprint of the code that built the index.
 const FINGERPRINT_KEY: &str = "index_fingerprint";
 
 /// Identity of the pipeline that produced the stored chunks and embeddings.
 /// A mismatch means the index on disk was built by different code (or against
 /// a different embedding model) and cannot be mixed with new rows, so it is
-/// cold-rebuilt. The embedding model comes from config because vectors from
+/// cold-rebuilt. The embedding model is in the fingerprint because vectors from
 /// two models are not comparable even at equal dimensions.
 fn index_fingerprint() -> String {
-    let model = crate::config::Config::load()
-        .unwrap_or_default()
-        .embeddings
-        .model;
+    let model = crate::embedder::EMBEDDING_MODEL;
     format!("schema={SCHEMA_VERSION};chunker={CHUNKER_VERSION};embedding={model}")
 }
 
@@ -164,57 +183,22 @@ impl Store {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
         let store = Store { conn, db_path };
-        store.check_schema_compat()?;
+        store.check_index_fingerprint()?;
         store.init_schema()?;
 
         Ok(store)
-    }
-
-    /// Refuse to operate on a pre-collections DB so we never silently
-    /// double-index or corrupt rows. No fallback by design. Then reconcile the
-    /// index fingerprint, cold-rebuilding when the pipeline has changed.
-    fn check_schema_compat(&self) -> Result<()> {
-        let chunks_exists: bool = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='chunks'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-        if !chunks_exists {
-            return self.check_index_fingerprint();
-        }
-        let has_col = self
-            .conn
-            .prepare("SELECT collection_id FROM chunks LIMIT 0")
-            .is_ok();
-        if has_col {
-            return self.check_index_fingerprint();
-        }
-        let chunk_count: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
-            .unwrap_or(0);
-        if chunk_count > 0 {
-            anyhow::bail!(
-                "Schema upgrade required (collections support added): existing 'chunks' table \
-                 has {} rows and lacks the collection_id column. Delete {} and re-index. \
-                 No backwards-compat shim by design.",
-                chunk_count,
-                self.db_path.display()
-            );
-        }
-        // Empty old schema — drop so init_schema can recreate with new columns.
-        self.conn
-            .execute_batch("DROP TABLE IF EXISTS chunks; DROP TABLE IF EXISTS files;")?;
-        self.check_index_fingerprint()
     }
 
     /// Drop the indexed data when [`index_fingerprint`] no longer matches what
     /// built it. Collections (a user's own configuration) survive; files,
     /// chunks, FTS and embeddings are recreated empty by `init_schema`, so the
     /// next `recall index` re-indexes everything from scratch.
+    ///
+    /// This is the only compatibility mechanism. A second one used to run
+    /// first, refuse to open a pre-collections database, and demand the user
+    /// delete the file by hand — a contradictory policy that also left
+    /// `fts_chunks` and `vec_embeddings` behind. A stale index is a rebuild,
+    /// never an error and never a migration.
     fn check_index_fingerprint(&self) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
@@ -227,11 +211,15 @@ impl Store {
                 params![FINGERPRINT_KEY],
                 |row| row.get(0),
             )
-            .ok();
+            .optional()?;
         if stored.as_deref() == Some(current.as_str()) {
             return Ok(());
         }
 
+        // The one COUNT(*) that may legitimately fail: this runs before
+        // `init_schema`, so on a fresh database `chunks` does not exist yet.
+        // The count only decides whether to print "discarding N chunks", so
+        // treating a missing table as zero is the right answer, not a swallow.
         let chunk_count: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
@@ -304,12 +292,9 @@ impl Store {
                 id INTEGER PRIMARY KEY,
                 file_id INTEGER NOT NULL,
                 collection_id INTEGER NOT NULL,
-                chunk_index INTEGER NOT NULL,
                 date TEXT,
                 date_source TEXT,
                 section TEXT,
-                project TEXT,
-                memory_type TEXT,
                 status TEXT,
                 start_line INTEGER NOT NULL,
                 end_line INTEGER NOT NULL,
@@ -348,10 +333,7 @@ impl Store {
             -- Create indexes
             CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id);
             CREATE INDEX IF NOT EXISTS idx_chunks_collection_id ON chunks(collection_id);
-            CREATE INDEX IF NOT EXISTS idx_chunks_date ON chunks(date);
-            CREATE INDEX IF NOT EXISTS idx_chunks_memory_type ON chunks(memory_type);
             CREATE INDEX IF NOT EXISTS idx_files_collection_id ON files(collection_id);
-            CREATE INDEX IF NOT EXISTS idx_files_mtime ON files(mtime);
         "#).context("Failed to initialize schema")?;
 
         // Create vec0 virtual table for vector embeddings (sqlite-vec)
@@ -374,17 +356,20 @@ impl Store {
         Ok(())
     }
 
-    /// Get store statistics
+    /// Get store statistics.
+    ///
+    /// Every count propagates its error. A swallowed `COUNT(*)` reports
+    /// "0 files, 0 chunks" for a corrupt database, which is exactly what a
+    /// fresh install reports — so `recall status` calls a broken index healthy
+    /// and `run_retrieval` blames the embeddings for the empty result.
     pub fn get_stats(&self) -> Result<StoreStats> {
         let file_count: i64 = self
             .conn
-            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
-            .unwrap_or(0);
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
 
         let chunk_count: i64 = self
             .conn
-            .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
-            .unwrap_or(0);
+            .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
 
         // Emit RFC3339 with explicit UTC offset (`...Z`) so consumers can render
         // in their own timezone instead of guessing whether the naive string is
@@ -394,9 +379,7 @@ impl Store {
             .conn
             .query_row("SELECT MAX(indexed_at) FROM files", [], |row| {
                 row.get::<_, Option<i64>>(0)
-            })
-            .ok()
-            .flatten()
+            })?
             .and_then(|ts| chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0))
             .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
 
@@ -428,8 +411,6 @@ impl Store {
                 c.date,
                 c.date_source,
                 c.section,
-                c.project,
-                c.memory_type,
                 c.status,
                 col.name,
                 col.description
@@ -466,11 +447,9 @@ impl Store {
                 date: row.get(5)?,
                 date_source: row.get(6)?,
                 section: row.get(7)?,
-                project: row.get(8)?,
-                memory_type: row.get(9)?,
-                status: row.get(10)?,
-                collection_name: row.get(11)?,
-                collection_description: row.get(12)?,
+                status: row.get(8)?,
+                collection_name: row.get(9)?,
+                collection_description: row.get(10)?,
             })
         })?;
 
@@ -547,45 +526,48 @@ impl Store {
         Ok(chunks)
     }
 
-    /// Get embedding statistics
+    /// Get embedding statistics.
+    ///
+    /// `run_retrieval` degrades to BM25-only when the embedded count is zero,
+    /// so a swallowed error here silently downgrades every search instead of
+    /// reporting the broken database.
     pub fn get_embedding_stats(&self) -> Result<(i64, i64)> {
         let total_chunks: i64 = self
             .conn
-            .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))
-            .unwrap_or(0);
+            .query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
 
-        let embedded_chunks: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM vec_embeddings", [], |row| row.get(0))
-            .unwrap_or(0);
+        let embedded_chunks: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM vec_embeddings", [], |row| row.get(0))?;
 
         Ok((embedded_chunks, total_chunks))
     }
 
     /// Vector search using sqlite-vec KNN, returning chunk IDs in rank order.
-    /// KNN cannot express the [`SearchOptions`] predicates, so when any filter
-    /// is set we ask for a larger neighbourhood and prune it afterwards —
-    /// still in rank order — until `limit` survivors remain.
+    /// KNN cannot express the [`SearchOptions`] predicates, so we always ask
+    /// for a larger neighbourhood and prune it afterwards — still in rank
+    /// order — until `limit` survivors remain. Unconditionally: a "is anything
+    /// filtered?" shortcut has to restate `append_filters`'s field list by
+    /// hand, and a stale copy of that list silently drops a predicate.
     fn search_vector_chunk_ids(
         &self,
         query_embedding: &[f32],
         limit: usize,
         options: &SearchOptions,
     ) -> Result<Vec<i64>> {
-        let filtered = options.is_filtered();
-        let knn_k = if filtered { limit * 4 } else { limit };
         let mut stmt = self
             .conn
             .prepare("SELECT rowid FROM vec_embeddings WHERE embedding MATCH ?1 AND k = ?2")?;
-        let rows = stmt.query_map(params![query_embedding.as_bytes(), knn_k as i64], |row| {
-            row.get::<_, i64>(0)
-        })?;
+        let rows = stmt.query_map(
+            params![query_embedding.as_bytes(), (limit * 4) as i64],
+            |row| row.get::<_, i64>(0),
+        )?;
         let mut ids: Vec<i64> = Vec::new();
         for row in rows {
             ids.push(row?);
         }
 
-        if !filtered || ids.is_empty() {
+        if ids.is_empty() {
             return Ok(ids);
         }
 
@@ -603,10 +585,10 @@ impl Store {
         let mut stmt = self.conn.prepare(&sql)?;
         let params_refs: Vec<&dyn rusqlite::ToSql> =
             params_vec.iter().map(|p| p.as_ref()).collect();
-        let allowed: std::collections::HashSet<i64> = stmt
-            .query_map(params_refs.as_slice(), |row| row.get::<_, i64>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
+        let mut allowed: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for row in stmt.query_map(params_refs.as_slice(), |row| row.get::<_, i64>(0))? {
+            allowed.insert(row?);
+        }
 
         let mut kept = Vec::with_capacity(limit);
         for id in ids {
@@ -632,11 +614,10 @@ impl Store {
         query: &str,
         query_embedding: &[f32],
         limit: usize,
-        rrf_k: u32,
         options: &SearchOptions,
     ) -> Result<Vec<(SearchResult, SearchTrace)>> {
         let candidate_count = limit * 3;
-        let k = rrf_k as f64;
+        let k = RRF_K;
 
         let bm25_ranked = self.search_fts_chunk_ids(query, candidate_count, options)?;
         let vector_ranked =
@@ -666,18 +647,24 @@ impl Store {
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         ranked.truncate(limit);
 
+        // Hydration skips a chunk that vanished between the ranking query and
+        // this one (`Ok(None)`), and propagates everything else. Treating a
+        // database error as "no such chunk" silently returns a shorter result
+        // list, which is indistinguishable from the vault simply not holding
+        // the answer.
         let mut out = Vec::new();
         for (chunk_id, rrf_score) in ranked {
-            if let Ok(Some(result)) = self.get_chunk_by_id(chunk_id, rrf_score) {
-                let trace = SearchTrace {
-                    bm25_rank: bm25_idx.get(&chunk_id).copied(),
-                    vec_rank: vec_idx.get(&chunk_id).copied(),
-                    rrf_score,
-                    rerank_score: None,
-                    ..Default::default()
-                };
-                out.push((result, trace));
-            }
+            let Some(result) = self.get_chunk_by_id(chunk_id, rrf_score)? else {
+                continue;
+            };
+            let trace = SearchTrace {
+                bm25_rank: bm25_idx.get(&chunk_id).copied(),
+                vec_rank: vec_idx.get(&chunk_id).copied(),
+                rrf_score,
+                rerank_score: None,
+                ..Default::default()
+            };
+            out.push((result, trace));
         }
         Ok(out)
     }
@@ -689,11 +676,10 @@ impl Store {
         &self,
         query: &str,
         limit: usize,
-        rrf_k: u32,
         options: &SearchOptions,
     ) -> Result<Vec<(SearchResult, SearchTrace)>> {
         let results = self.search_fts_filtered(query, limit, options)?;
-        let k = rrf_k as f64;
+        let k = RRF_K;
         Ok(results
             .into_iter()
             .enumerate()
@@ -714,8 +700,8 @@ impl Store {
     fn get_chunk_by_id(&self, chunk_id: i64, score: f64) -> Result<Option<SearchResult>> {
         let result = self.conn.query_row(
             r#"SELECT f.file_path, c.start_line, c.end_line, c.content,
-                      c.date, c.date_source, c.section, c.project,
-                      c.memory_type, c.status, col.name, col.description
+                      c.date, c.date_source, c.section, c.status,
+                      col.name, col.description
                FROM chunks c
                JOIN files f ON f.id = c.file_id
                JOIN collections col ON col.id = c.collection_id
@@ -731,11 +717,9 @@ impl Store {
                     date: row.get(4)?,
                     date_source: row.get(5)?,
                     section: row.get(6)?,
-                    project: row.get(7)?,
-                    memory_type: row.get(8)?,
-                    status: row.get(9)?,
-                    collection_name: row.get(10)?,
-                    collection_description: row.get(11)?,
+                    status: row.get(7)?,
+                    collection_name: row.get(8)?,
+                    collection_description: row.get(9)?,
                 })
             },
         );
@@ -750,26 +734,20 @@ impl Store {
     /// Delete vec_embeddings for chunks belonging to a (collection, file) pair.
     /// Same physical file path can exist in multiple collections; we only
     /// drop embeddings for the one being re-indexed.
+    ///
+    /// One statement, and it propagates. `vec0` has no foreign keys, so a
+    /// failure here leaves embeddings on chunk ids that `index_file` is about
+    /// to delete and reuse — the caller then writes new chunks that inherit
+    /// vectors describing the file's previous text. That is the exact
+    /// corruption `orphan_counts().embeddings` exists to report, so producing
+    /// it quietly is the worst possible outcome.
     fn delete_embeddings_for_file(&self, collection_id: i64, file_path: &str) -> Result<()> {
-        let mut stmt = self.conn.prepare(
-            "SELECT c.id FROM chunks c JOIN files f ON f.id = c.file_id \
-             WHERE f.collection_id = ?1 AND f.file_path = ?2",
+        self.conn.execute(
+            "DELETE FROM vec_embeddings WHERE rowid IN \
+             (SELECT c.id FROM chunks c JOIN files f ON f.id = c.file_id \
+              WHERE f.collection_id = ?1 AND f.file_path = ?2)",
+            params![collection_id, file_path],
         )?;
-        let chunk_ids: Vec<i64> = stmt
-            .query_map(params![collection_id, file_path], |row| {
-                row.get::<_, i64>(0)
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        for chunk_id in chunk_ids {
-            self.conn
-                .execute(
-                    "DELETE FROM vec_embeddings WHERE rowid = ?1",
-                    params![chunk_id],
-                )
-                .ok();
-        }
         Ok(())
     }
 
@@ -812,22 +790,19 @@ impl Store {
 
         let file_id = self.conn.last_insert_rowid();
 
-        for (i, chunk) in chunks.iter().enumerate() {
+        for chunk in &chunks {
             self.conn.execute(
-                r#"INSERT INTO chunks (file_id, collection_id, chunk_index, date, date_source, section, project, start_line, end_line, content, memory_type, status)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
+                r#"INSERT INTO chunks (file_id, collection_id, date, date_source, section, start_line, end_line, content, status)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
                 params![
                     file_id,
                     collection_id,
-                    i as i64,
                     chunk.date,
                     chunk.date_source,
                     chunk.section,
-                    chunk.project,
                     chunk.start_line,
                     chunk.end_line,
                     chunk.content,
-                    chunk.memory_type,
                     chunk.status,
                 ],
             )?;
@@ -837,51 +812,57 @@ impl Store {
         Ok(())
     }
 
-    /// Full re-index of a directory into a collection (drops all of that
-    /// collection's existing rows first, then walks the tree).
-    pub fn index_full(&self, collection_id: i64, dir_path: &str) -> Result<()> {
-        // Drop embeddings for chunks in this collection
-        self.conn.execute(
-            "DELETE FROM vec_embeddings WHERE rowid IN \
-             (SELECT id FROM chunks WHERE collection_id = ?1)",
-            params![collection_id],
-        )?;
-        self.conn.execute(
-            "DELETE FROM chunks WHERE collection_id = ?1",
-            params![collection_id],
-        )?;
-        self.conn.execute(
-            "DELETE FROM files WHERE collection_id = ?1",
-            params![collection_id],
-        )?;
-        self.index_directory(collection_id, dir_path)
+    /// Reconcile a collection with the directory it indexes: re-chunk every
+    /// markdown file whose mtime moved, then drop every indexed file that is
+    /// no longer on disk.
+    ///
+    /// There is deliberately only one of these. There used to be a "full" and
+    /// an "incremental" mode, and the only difference was that "full" dropped
+    /// the collection's rows first — which made it the only mode that removed
+    /// a deleted note's chunks. The CLI defaulted to full and the MCP tool and
+    /// watcher always ran incremental, so a note deleted from the vault stayed
+    /// searchable forever, silently, for whoever used the other front end.
+    /// Reconciling on every run makes deletion work everywhere and costs one
+    /// `Path::exists` per indexed file.
+    pub fn index(&self, collection_id: i64, dir_path: &str) -> Result<()> {
+        self.index_directory(collection_id, dir_path)?;
+        self.prune_missing_files(collection_id)
     }
 
-    /// Incremental index (only changed files) into the given collection.
-    pub fn index_incremental(&self, collection_id: i64, dir_path: &str) -> Result<()> {
-        self.index_directory(collection_id, dir_path)
+    /// Forget every file of this collection that has left the filesystem.
+    /// Chunks follow by `ON DELETE CASCADE`; embeddings live in a vec0 virtual
+    /// table with no foreign keys, so they are deleted explicitly first.
+    fn prune_missing_files(&self, collection_id: i64) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file_path FROM files WHERE collection_id = ?1")?;
+        let indexed: Vec<String> = stmt
+            .query_map(params![collection_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        for file_path in indexed {
+            if std::path::Path::new(&file_path).exists() {
+                continue;
+            }
+            self.delete_embeddings_for_file(collection_id, &file_path)?;
+            self.conn.execute(
+                "DELETE FROM files WHERE collection_id = ?1 AND file_path = ?2",
+                params![collection_id, file_path],
+            )?;
+        }
+        Ok(())
     }
 
     /// Index all markdown files in a directory into a collection
     fn index_directory(&self, collection_id: i64, dir_path: &str) -> Result<()> {
         let pattern = format!("{}/**/*.md", dir_path);
-        let exclude_patterns = [
-            "**/Templates/**",
-            "**/.obsidian/**",
-            "**/attachments/**",
-            "**/*.sync-conflict-*",
-        ];
 
         for entry in glob::glob(&pattern)? {
             let path = entry?;
             let path_str = path.to_string_lossy().to_string();
 
-            let should_skip = exclude_patterns.iter().any(|pattern| {
-                glob::Pattern::new(pattern)
-                    .map(|p| p.matches(&path_str))
-                    .unwrap_or(false)
-            });
-            if should_skip {
+            if is_excluded(&path_str) {
                 continue;
             }
 
@@ -913,17 +894,14 @@ impl Store {
 
     // ── Collection CRUD ───────────────────────────────────────────────────
 
-    pub fn create_collection(
-        &self,
-        name: &str,
-        root_path: &str,
-        half_life_days: Option<f64>,
-    ) -> Result<Collection> {
+    /// A new collection starts with no half-life and no description;
+    /// `recall collection half-life` and `recall collection describe` are the
+    /// only writers of those two columns.
+    pub fn create_collection(&self, name: &str, root_path: &str) -> Result<Collection> {
         let now = Utc::now().timestamp();
         self.conn.execute(
-            "INSERT INTO collections (name, root_path, half_life_days, created_at) \
-             VALUES (?1, ?2, ?3, ?4)",
-            params![name, root_path, half_life_days, now],
+            "INSERT INTO collections (name, root_path, created_at) VALUES (?1, ?2, ?3)",
+            params![name, root_path, now],
         )?;
         let id = self.conn.last_insert_rowid();
         Ok(Collection {
@@ -931,7 +909,7 @@ impl Store {
             name: name.to_string(),
             root_path: root_path.to_string(),
             description: None,
-            half_life_days,
+            half_life_days: None,
             created_at: now,
         })
     }
@@ -996,7 +974,7 @@ impl Store {
     }
 
     /// Set or clear a collection's recency half-life (days). `None` clears it,
-    /// so the collection falls back to `config.decay.default_half_life_days`.
+    /// so the collection falls back to `search::DEFAULT_HALF_LIFE_DAYS`.
     /// Returns false if no collection by that name exists.
     pub fn set_collection_half_life(
         &self,
@@ -1126,16 +1104,6 @@ fn append_filters(
         sql.push_str(" AND c.date <= ?");
         params.push(Box::new(before.clone()));
     }
-    // `--project` matches on the section heading, not `chunks.project`,
-    // which the chunker never populates.
-    if let Some(project) = &options.project {
-        sql.push_str(" AND c.section LIKE ?");
-        params.push(Box::new(format!("%{}%", project)));
-    }
-    if let Some(file_pattern) = &options.file_pattern {
-        sql.push_str(" AND f.file_path LIKE ?");
-        params.push(Box::new(file_pattern.replace('*', "%").replace('?', "_")));
-    }
     if let Some(cid) = options.collection_id {
         sql.push_str(" AND c.collection_id = ?");
         params.push(Box::new(cid));
@@ -1185,8 +1153,8 @@ mod tests {
 
         let store = Store::open_at(dir.path().join("memory.sqlite")).unwrap();
         let root = vault.to_string_lossy().to_string();
-        let collection = store.create_collection("t", &root, None).unwrap();
-        store.index_full(collection.id, &root).unwrap();
+        let collection = store.create_collection("t", &root).unwrap();
+        store.index(collection.id, &root).unwrap();
 
         let embedding = vec![0.1f32; 768];
         for (chunk_id, _) in store.get_chunks_without_embeddings().unwrap() {
@@ -1197,11 +1165,120 @@ mod tests {
 
     fn hybrid_paths(store: &Store, embedding: &[f32], options: &SearchOptions) -> Vec<String> {
         store
-            .search_hybrid_traced("quokka zebra", embedding, 10, 60, options)
+            .search_hybrid_traced("quokka zebra", embedding, 10, options)
             .unwrap()
             .into_iter()
             .map(|(r, _)| r.file_path)
             .collect()
+    }
+
+    /// The fingerprint is the only compatibility mechanism, so this is the
+    /// whole upgrade story: a database built by different code is rebuilt, not
+    /// migrated and not refused. Collections are the user's own configuration
+    /// and survive it.
+    /// One list, so the indexer, the linter, and the watcher cannot disagree
+    /// about what a note is. The watcher used to substring-match `"Templates/"`
+    /// against the whole path, which is not what someone writing that pattern
+    /// means.
+    #[test]
+    fn exclusion_is_one_case_insensitive_glob_list() {
+        assert!(is_excluded("/v/Templates/daily.md"));
+        assert!(is_excluded("/v/templates/nested/daily.md"));
+        assert!(is_excluded("/v/.obsidian/workspace.json"));
+        assert!(is_excluded("/v/attachments/img.png"));
+        assert!(is_excluded("/v/notes/a.sync-conflict-20260101-ABCDEF.md"));
+
+        assert!(!is_excluded("/v/notes/a.md"));
+        assert!(!is_excluded("/v/NotTemplatesReally/a.md"));
+    }
+
+    #[test]
+    fn a_stale_index_fingerprint_drops_the_index_and_keeps_collections() {
+        let (dir, store, _) = indexed_store();
+        assert!(store.get_stats().unwrap().chunk_count > 0);
+
+        store
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
+                params![FINGERPRINT_KEY, "schema=0;chunker=0;embedding=ancient"],
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open_at(dir.path().join("memory.sqlite")).unwrap();
+        let stats = reopened.get_stats().unwrap();
+        assert_eq!(stats.chunk_count, 0);
+        assert_eq!(stats.file_count, 0);
+        assert_eq!(reopened.get_embedding_stats().unwrap().0, 0);
+        assert_eq!(reopened.list_collections().unwrap().len(), 1);
+    }
+
+    /// A broken database must not read as an empty one. Both stat calls used
+    /// to `.unwrap_or(0)` their counts, so a corrupt index reported "0 files,
+    /// 0 chunks, no embeddings" — byte for byte what a fresh install reports.
+    /// `run_retrieval` then blamed the missing embeddings and quietly degraded
+    /// every search to BM25.
+    #[test]
+    fn a_broken_database_errors_instead_of_reporting_an_empty_index() {
+        let (_dir, store, _) = indexed_store();
+        assert!(store.get_stats().unwrap().chunk_count > 0);
+
+        store.conn.execute_batch("DROP TABLE chunks;").unwrap();
+
+        assert!(store.get_stats().is_err());
+        assert!(store.get_embedding_stats().is_err());
+    }
+
+    /// Hydration must propagate a database error rather than drop the hit.
+    /// Dropping `collections.description` breaks only `get_chunk_by_id` — the
+    /// ranking queries do not read it — so this reproduces the exact shape of
+    /// the bug: ranked chunk ids that cannot be turned into results. The old
+    /// `if let Ok(Some(..))` returned `Ok(vec![])` here, which the caller
+    /// renders as "no matches in your vault".
+    #[test]
+    fn a_hydration_error_fails_the_search_instead_of_shortening_it() {
+        let (_dir, store, embedding) = indexed_store();
+        assert_eq!(
+            hybrid_paths(&store, &embedding, &SearchOptions::default()).len(),
+            2
+        );
+
+        store
+            .conn
+            .execute_batch("ALTER TABLE collections DROP COLUMN description;")
+            .unwrap();
+
+        assert!(store
+            .search_hybrid_traced("quokka zebra", &embedding, 10, &SearchOptions::default())
+            .is_err());
+    }
+
+    /// Re-indexing a file must take its embeddings with it, and must say so
+    /// when it cannot. `index_file` deletes the file's chunks and inserts new
+    /// ones, and SQLite hands the freed rowids straight back out — so a
+    /// vector that survives the delete reattaches to a different chunk's text.
+    /// `vec0` has no foreign keys, so nothing downstream catches that.
+    ///
+    /// Dropping `vec_embeddings` stands in for any failure of the delete: the
+    /// swallowed `.ok()` let `index_file` report success and write the corrupt
+    /// state anyway.
+    #[test]
+    fn a_failed_embedding_delete_fails_the_re_index() {
+        let (dir, store, _) = indexed_store();
+        let collection_id = store.list_collections().unwrap()[0].id;
+        let note = dir.path().join("vault").join("2026-01-02.md");
+        let note = note.to_string_lossy().to_string();
+
+        std::fs::write(&note, "# New\n\nquokka zebra\n\n## Extra\n\nmore text\n").unwrap();
+        store.index_file(collection_id, &note).unwrap();
+        assert_eq!(store.orphan_counts().unwrap().embeddings, 0);
+
+        store
+            .conn
+            .execute_batch("DROP TABLE vec_embeddings;")
+            .unwrap();
+        assert!(store.index_file(collection_id, &note).is_err());
     }
 
     #[test]
@@ -1224,9 +1301,10 @@ mod tests {
         assert!(recent.iter().all(|p| p.ends_with("2026-01-02.md")));
     }
 
-    /// `before` was added to `append_filters` after the vector path's
-    /// "is anything filtered?" check was written, so a `before`-only search
-    /// skipped the prune entirely and the KNN candidates came back unbounded.
+    /// `before` alone must bound the vector path too. It once did not: the
+    /// prune ran behind an "is anything filtered?" check that had never been
+    /// taught about `before`, so a `before`-only search returned unbounded
+    /// KNN candidates. The check is gone; this pins the behaviour.
     #[test]
     fn hybrid_search_honors_a_lone_before_filter() {
         let (_dir, store, embedding) = indexed_store();
@@ -1241,22 +1319,6 @@ mod tests {
         );
         assert!(!old.is_empty());
         assert!(old.iter().all(|p| p.ends_with("2020-01-02.md")));
-    }
-
-    #[test]
-    fn hybrid_search_honors_the_file_pattern_filter() {
-        let (_dir, store, embedding) = indexed_store();
-
-        let matched = hybrid_paths(
-            &store,
-            &embedding,
-            &SearchOptions {
-                file_pattern: Some("*2020-01-02*".to_string()),
-                ..Default::default()
-            },
-        );
-        assert!(!matched.is_empty());
-        assert!(matched.iter().all(|p| p.ends_with("2020-01-02.md")));
     }
 
     #[test]

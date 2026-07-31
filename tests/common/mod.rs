@@ -2,8 +2,9 @@
 //! Shared test helpers: hermetic recall sandbox + fixture vault builders.
 //!
 //! Every integration test routes through `RecallSandbox`, which sets
-//! `RECALL_DB_PATH` and `RECALL_CONFIG_PATH` to per-test tempdirs so the
-//! suite cannot touch a developer's real database or config.
+//! `RECALL_DB_PATH` to a per-test tempdir so the suite cannot touch a
+//! developer's real database. There is no config file to sandbox: recall has
+//! no configuration.
 
 use assert_cmd::Command as AssertCommand;
 use std::path::{Path, PathBuf};
@@ -24,15 +25,10 @@ impl RecallSandbox {
         self.home.path().join("memory.sqlite")
     }
 
-    pub fn config_path(&self) -> PathBuf {
-        self.home.path().join("config.toml")
-    }
-
     /// `recall <args>` with hermetic env vars applied.
     pub fn cmd(&self) -> AssertCommand {
         let mut c = AssertCommand::cargo_bin("recall").expect("recall binary built");
         c.env("RECALL_DB_PATH", self.db_path())
-            .env("RECALL_CONFIG_PATH", self.config_path())
             .env("RUST_LOG", "warn");
         c
     }
@@ -46,7 +42,6 @@ impl RecallSandbox {
             .to_owned();
         let mut c = std::process::Command::new(exe);
         c.env("RECALL_DB_PATH", self.db_path())
-            .env("RECALL_CONFIG_PATH", self.config_path())
             .env("RUST_LOG", "warn");
         c
     }

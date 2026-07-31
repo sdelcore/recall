@@ -1,7 +1,15 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
+/// The embedding model, and therefore half of the index fingerprint. Changing
+/// it makes every stored vector incomparable and cold-rebuilds the whole
+/// index, so it is a code change with a consequence, not a setting.
+pub const EMBEDDING_MODEL: &str = "nomic-embed-text";
+
+/// Where Ollama listens. The one value with a plausible second setting — a
+/// remote GPU box — so it stays overridable, by environment variable rather
+/// than by a config file that would exist only for this.
+const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 
 /// Ollama embedding client
 pub struct Embedder {
@@ -22,18 +30,18 @@ struct EmbeddingResponse {
 }
 
 impl Embedder {
-    /// Create embedder from Config
-    pub fn new_with_config(config: &Config) -> Self {
-        Self::with_url_and_model(&config.embeddings.ollama_url, &config.embeddings.model)
-    }
-
-    /// Create embedder with custom URL and model
-    pub fn with_url_and_model(base_url: &str, model: &str) -> Self {
+    pub fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
-            base_url: base_url.to_string(),
-            model: model.to_string(),
+            base_url: ollama_url(),
+            model: EMBEDDING_MODEL.to_string(),
         }
+    }
+
+    /// The URL this client talks to, for the connectivity message `recall
+    /// embed` prints before it does any work.
+    pub fn url(&self) -> &str {
+        &self.base_url
     }
 
     /// Generate embedding for a single text
@@ -121,4 +129,9 @@ impl Embedder {
         eprintln!("Model '{}' pulled successfully.", self.model);
         Ok(())
     }
+}
+
+/// `RECALL_OLLAMA_URL`, or localhost.
+fn ollama_url() -> String {
+    std::env::var("RECALL_OLLAMA_URL").unwrap_or_else(|_| DEFAULT_OLLAMA_URL.to_string())
 }

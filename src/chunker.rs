@@ -1,10 +1,9 @@
 //! Turn a markdown file into the chunk records that get persisted.
 //!
 //! Wraps the structural AST chunker (`crate::ast`) with file-level metadata
-//! enrichment: the chunk's date, a memory type, and the note's `status`. The
-//! persistence layer calls [`chunk_file`] and writes the resulting
-//! [`Chunk`]s; the heuristics here are kept private and unit-tested in
-//! isolation.
+//! enrichment: the chunk's date and the note's `status`. The persistence
+//! layer calls [`chunk_file`] and writes the resulting [`Chunk`]s; the
+//! heuristics here are kept private and unit-tested in isolation.
 //!
 //! The date matters more than the other fields because recency ranking is
 //! built on it, so it is resolved through an explicit cascade — frontmatter,
@@ -30,8 +29,6 @@ pub struct Chunk {
     /// `"frontmatter"`, `"filename"`, or `"mtime"`.
     pub date_source: Option<String>,
     pub section: Option<String>,
-    pub project: Option<String>,
-    pub memory_type: Option<String>,
     /// Frontmatter `status:`, carried through verbatim. Recorded and
     /// returned, never used to filter or exclude results.
     pub status: Option<String>,
@@ -44,7 +41,6 @@ pub struct Chunk {
 pub fn chunk_file(content: &str, file_path: &str, mtime: i64) -> Vec<Chunk> {
     let frontmatter = crate::frontmatter::parse(content);
     let (date, date_source) = resolve_date(&frontmatter, file_path, mtime);
-    let memory_type = resolve_memory_type(&frontmatter, file_path);
     let status = frontmatter.status;
 
     crate::ast::chunk_markdown_ast(content, MAX_CHUNK_CHARS)
@@ -56,8 +52,6 @@ pub fn chunk_file(content: &str, file_path: &str, mtime: i64) -> Vec<Chunk> {
             section: raw.section,
             date: date.clone(),
             date_source: date_source.clone(),
-            project: None,
-            memory_type: memory_type.clone(),
             status: status.clone(),
         })
         .collect()
@@ -91,25 +85,6 @@ fn resolve_date(
     }
 }
 
-/// Frontmatter `type:` wins over the path heuristics; an unrecognized type
-/// falls through to them rather than blanking the classification.
-fn resolve_memory_type(frontmatter: &Frontmatter, file_path: &str) -> Option<String> {
-    frontmatter
-        .doc_type
-        .as_deref()
-        .and_then(memory_type_from_frontmatter)
-        .or_else(|| classify_memory_type(file_path))
-}
-
-/// Map a note's declared `type:` onto a memory type.
-fn memory_type_from_frontmatter(doc_type: &str) -> Option<String> {
-    match doc_type.trim().to_ascii_lowercase().as_str() {
-        "session" | "scratchpad" => Some("episodic".to_string()),
-        "project" => Some("semantic".to_string()),
-        _ => None,
-    }
-}
-
 /// Pull a date out of filenames matching `YYYY-MM-DD.*` (daily notes).
 /// Other filenames return None — date is opportunistic, not required.
 fn extract_date_from_filename(file_path: &str) -> Option<String> {
@@ -118,45 +93,6 @@ fn extract_date_from_filename(file_path: &str) -> Option<String> {
         .and_then(|s| s.to_str())
         .filter(|s| s.len() == 10 && s.chars().nth(4) == Some('-') && s.chars().nth(7) == Some('-'))
         .map(|s| s.to_string())
-}
-
-/// Classify a file into a memory type based on its path.
-/// Returns: "semantic", "procedural", "episodic", "skill", or None for general content.
-fn classify_memory_type(file_path: &str) -> Option<String> {
-    let path_lower = file_path.to_lowercase();
-
-    // Skills directory
-    if path_lower.contains("/aria/skills/") {
-        return Some("skill".to_string());
-    }
-
-    // ARIA core files
-    if path_lower.ends_with("/memory.md") && path_lower.contains("/aria/") {
-        return Some("semantic".to_string());
-    }
-    if path_lower.ends_with("/soul.md") || path_lower.ends_with("/user.md") {
-        return Some("semantic".to_string());
-    }
-    if path_lower.ends_with("/issues.md") && path_lower.contains("/aria/") {
-        return Some("procedural".to_string());
-    }
-
-    // Daily notes (both user and ARIA)
-    if path_lower.contains("/daily notes/") || path_lower.contains("/periodic/daily/") {
-        return Some("episodic".to_string());
-    }
-
-    // Messages
-    if path_lower.contains("/aria/messages/") {
-        return Some("episodic".to_string());
-    }
-
-    // Contacts
-    if path_lower.contains("/aria/contacts/") {
-        return Some("semantic".to_string());
-    }
-
-    None
 }
 
 #[cfg(test)]
@@ -182,72 +118,6 @@ mod tests {
     fn extract_date_ignores_dashes_in_wrong_positions() {
         // Length 10 but dashes not at 4 and 7 → reject.
         assert_eq!(extract_date_from_filename("/vault/abc-def-gh.md"), None);
-    }
-
-    #[test]
-    fn classify_skill_directory() {
-        assert_eq!(
-            classify_memory_type("/home/u/Obsidian/aria/skills/coding.md"),
-            Some("skill".to_string())
-        );
-    }
-
-    #[test]
-    fn classify_aria_core_files() {
-        assert_eq!(
-            classify_memory_type("/Obsidian/aria/memory.md"),
-            Some("semantic".to_string())
-        );
-        assert_eq!(
-            classify_memory_type("/anywhere/soul.md"),
-            Some("semantic".to_string())
-        );
-        assert_eq!(
-            classify_memory_type("/anywhere/user.md"),
-            Some("semantic".to_string())
-        );
-        assert_eq!(
-            classify_memory_type("/Obsidian/aria/issues.md"),
-            Some("procedural".to_string())
-        );
-    }
-
-    #[test]
-    fn classify_daily_notes() {
-        assert_eq!(
-            classify_memory_type("/vault/Daily Notes/2026-04-29.md"),
-            Some("episodic".to_string())
-        );
-        assert_eq!(
-            classify_memory_type("/vault/periodic/daily/2026-04-29.md"),
-            Some("episodic".to_string())
-        );
-    }
-
-    #[test]
-    fn classify_aria_messages_and_contacts() {
-        assert_eq!(
-            classify_memory_type("/vault/aria/messages/2026-04-29.md"),
-            Some("episodic".to_string())
-        );
-        assert_eq!(
-            classify_memory_type("/vault/aria/contacts/alice.md"),
-            Some("semantic".to_string())
-        );
-    }
-
-    #[test]
-    fn classify_unmatched_paths_return_none() {
-        assert_eq!(classify_memory_type("/vault/projects/foo.md"), None);
-        assert_eq!(classify_memory_type("/vault/random.md"), None);
-    }
-
-    #[test]
-    fn classify_is_case_insensitive() {
-        assert_eq!(
-            classify_memory_type("/Vault/ARIA/Skills/Coding.md"),
-            Some("skill".to_string())
-        );
     }
 
     /// 2026-04-29T00:00:00Z — a fixed mtime so tests never depend on the clock.
@@ -298,49 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_type_maps_frontmatter_types() {
-        assert_eq!(
-            memory_type_from_frontmatter("session"),
-            Some("episodic".to_string())
-        );
-        assert_eq!(
-            memory_type_from_frontmatter("Scratchpad"),
-            Some("episodic".to_string())
-        );
-        assert_eq!(
-            memory_type_from_frontmatter("project"),
-            Some("semantic".to_string())
-        );
-        assert_eq!(memory_type_from_frontmatter("unknown"), None);
-    }
-
-    #[test]
-    fn memory_type_frontmatter_overrides_path_heuristic() {
-        assert_eq!(
-            resolve_memory_type(&fm("type: project"), "/vault/Daily Notes/2026-04-29.md"),
-            Some("semantic".to_string())
-        );
-    }
-
-    #[test]
-    fn memory_type_falls_back_to_path_heuristic() {
-        // No frontmatter at all, and an unrecognized type, both fall through.
-        assert_eq!(
-            resolve_memory_type(&Frontmatter::default(), "/vault/Daily Notes/2026-04-29.md"),
-            Some("episodic".to_string())
-        );
-        assert_eq!(
-            resolve_memory_type(&fm("type: meeting"), "/vault/Daily Notes/2026-04-29.md"),
-            Some("episodic".to_string())
-        );
-        assert_eq!(
-            resolve_memory_type(&fm("type: meeting"), "/vault/projects/foo.md"),
-            None
-        );
-    }
-
-    #[test]
-    fn chunk_file_stamps_date_and_memory_type_on_every_chunk() {
+    fn chunk_file_stamps_the_date_on_every_chunk() {
         let content = "# Heading One\n\nSome content.\n\n## Heading Two\n\nMore content.\n";
         let chunks = chunk_file(content, "/vault/Daily Notes/2026-04-29.md", MTIME);
 
@@ -348,15 +176,13 @@ mod tests {
         for c in &chunks {
             assert_eq!(c.date.as_deref(), Some("2026-04-29"));
             assert_eq!(c.date_source.as_deref(), Some("filename"));
-            assert_eq!(c.memory_type.as_deref(), Some("episodic"));
-            assert_eq!(c.project, None);
             assert_eq!(c.status, None);
         }
     }
 
     #[test]
     fn chunk_file_stamps_frontmatter_metadata_on_every_chunk() {
-        let content = "---\ndate: 2026-01-02\nstatus: active\ntype: project\n---\n\n\
+        let content = "---\ndate: 2026-01-02\nstatus: active\n---\n\n\
                        # Heading One\n\nSome content.\n\n## Heading Two\n\nMore.\n";
         let chunks = chunk_file(content, "/vault/Daily Notes/2026-04-29.md", MTIME);
 
@@ -364,7 +190,6 @@ mod tests {
         for c in &chunks {
             assert_eq!(c.date.as_deref(), Some("2026-01-02"));
             assert_eq!(c.date_source.as_deref(), Some("frontmatter"));
-            assert_eq!(c.memory_type.as_deref(), Some("semantic"));
             assert_eq!(c.status.as_deref(), Some("active"));
         }
     }
@@ -378,7 +203,6 @@ mod tests {
         for c in &chunks {
             assert_eq!(c.date.as_deref(), Some("2026-04-29"));
             assert_eq!(c.date_source.as_deref(), Some("mtime"));
-            assert_eq!(c.memory_type, None);
         }
     }
 

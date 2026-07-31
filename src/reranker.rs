@@ -1,21 +1,25 @@
 //! LLM-based reranking for search results.
 //!
-//! Three concrete adapters satisfy the `Reranker` trait:
-//! `ClaudeCodeReranker` (claude-agent-sdk, default, no API key),
-//! `AnthropicReranker` (direct Messages API, parallel calls, needs key),
-//! and `OllamaReranker` (local model, offline fallback).
+//! One adapter: `ClaudeCodeReranker` (claude-agent-sdk, no API key). The
+//! `Reranker` trait stays because it is the test seam — orchestration is
+//! covered by unit tests against a fake adapter, never against the SDK.
 //!
-//! `rerank` is the orchestration entry point: it constructs the adapter from
-//! config, calls `score`, validates the result, sorts, and falls back to RRF
-//! order on any failure. The trait is the test seam — orchestration is covered
-//! by unit tests against a fake adapter.
+//! `rerank` is the orchestration entry point: it calls `score`, validates the
+//! result, sorts, and truncates. It does **not** degrade to RRF order on
+//! failure. A caller that asked for reranking and got unreranked results has
+//! no way to tell — over MCP the warning never reaches the model — so every
+//! failure propagates as an error instead.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use async_trait::async_trait;
 use tracing::{debug, info, warn};
 
-use crate::config::RerankConfig;
 use crate::store::SearchResult;
+
+/// Model the reranker asks. Haiku is the cheapest model that can hold twenty
+/// snippets and emit twenty numbers; a bigger one costs latency the caller is
+/// already paying seconds for.
+const RERANK_MODEL: &str = "haiku";
 
 /// Score `candidates` for relevance to `query`. Returns one f64 in `[0, 10]`
 /// per candidate, in the same order. Caller is responsible for sorting and
@@ -25,42 +29,19 @@ pub trait Reranker: Send + Sync {
     async fn score(&self, query: &str, candidates: &[SearchResult]) -> Result<Vec<f64>>;
 }
 
-/// Build the adapter for the configured provider, validating per-provider
-/// config invariants. Errors here mean the config is unusable; callers should
-/// surface them rather than silently fall back.
-pub fn build_reranker(config: &RerankConfig) -> Result<Box<dyn Reranker>> {
-    match config.provider.as_str() {
-        "claude-code" => Ok(Box::new(ClaudeCodeReranker::from_config(config))),
-        "anthropic" => Ok(Box::new(AnthropicReranker::from_config(config)?)),
-        "ollama" => Ok(Box::new(OllamaReranker::from_config(config))),
-        other => bail!(
-            "Unknown reranking provider {:?}. Valid providers: claude-code, anthropic, ollama",
-            other
-        ),
-    }
-}
-
-/// Rerank search results using the configured LLM provider.
+/// Rerank search results with an LLM.
 ///
-/// Takes `candidates` (pre-sorted by RRF), scores each for relevance to `query`,
-/// and returns the top `top_k` results re-sorted by LLM score.
-///
-/// On failure, logs a warning and returns the original candidates truncated to `top_k`
-/// (never silently degrades — always logs why reranking was skipped).
+/// Takes `candidates` (pre-sorted by RRF), scores each for relevance to
+/// `query`, and returns the top `top_k` re-sorted by LLM score. Errors if the
+/// model is unreachable or answers with anything other than one score per
+/// candidate. How many candidates arrive is the pipeline's decision, not this
+/// module's — `search.rs` over-fetches for exactly this reason.
 pub async fn rerank(
     query: &str,
     candidates: Vec<SearchResult>,
-    config: &RerankConfig,
-) -> Vec<SearchResult> {
-    let reranker = match build_reranker(config) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("{}. Falling back to RRF order.", e);
-            let top_k = config.top_k.min(candidates.len());
-            return candidates.into_iter().take(top_k).collect();
-        }
-    };
-    rerank_with(reranker.as_ref(), query, candidates, config).await
+    top_k: usize,
+) -> Result<Vec<SearchResult>> {
+    rerank_with(&ClaudeCodeReranker, query, candidates, top_k).await
 }
 
 /// Orchestration variant taking an explicit reranker. Exposed so the search
@@ -69,70 +50,45 @@ pub async fn rerank_with(
     reranker: &dyn Reranker,
     query: &str,
     candidates: Vec<SearchResult>,
-    config: &RerankConfig,
-) -> Vec<SearchResult> {
+    top_k: usize,
+) -> Result<Vec<SearchResult>> {
     if candidates.is_empty() {
-        return candidates;
+        return Ok(candidates);
     }
 
-    let top_k = config.top_k.min(candidates.len());
-    let to_rerank = config.candidates.min(candidates.len());
-    let rerank_input: Vec<SearchResult> = candidates.into_iter().take(to_rerank).collect();
+    let top_k = top_k.min(candidates.len());
 
-    let result = reranker.score(query, &rerank_input).await;
+    let scores = reranker
+        .score(query, &candidates)
+        .await
+        .context("Reranking failed")?;
 
-    match result {
-        Ok(scores) => {
-            if scores.len() != rerank_input.len() {
-                warn!(
-                    "Reranker returned {} scores for {} candidates — expected equal count. \
-                     Falling back to RRF order.",
-                    scores.len(),
-                    rerank_input.len()
-                );
-                return rerank_input.into_iter().take(top_k).collect();
-            }
+    ensure!(
+        scores.len() == candidates.len(),
+        "Reranker returned {} scores for {} candidates — expected equal count",
+        scores.len(),
+        candidates.len()
+    );
 
-            let valid_count = scores.iter().filter(|s| **s >= 0.0).count();
-            if valid_count == 0 {
-                warn!(
-                    "All {} reranker scores were invalid (<0). \
-                     Falling back to RRF order. Scores: {:?}",
-                    scores.len(),
-                    scores
-                );
-                return rerank_input.into_iter().take(top_k).collect();
-            }
+    let mut scored: Vec<(f64, SearchResult)> = scores.into_iter().zip(candidates).collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
-            let mut scored: Vec<(f64, SearchResult)> =
-                scores.into_iter().zip(rerank_input).collect();
-            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    info!(
+        "Reranked {} candidates → top {} (scores: {:.1}..{:.1})",
+        scored.len(),
+        top_k,
+        scored.first().map(|s| s.0).unwrap_or(0.0),
+        scored.last().map(|s| s.0).unwrap_or(0.0),
+    );
 
-            info!(
-                "Reranked {} candidates → top {} (scores: {:.1}..{:.1})",
-                scored.len(),
-                top_k,
-                scored.first().map(|s| s.0).unwrap_or(0.0),
-                scored.last().map(|s| s.0).unwrap_or(0.0),
-            );
-
-            scored
-                .into_iter()
-                .take(top_k)
-                .map(|(score, mut r)| {
-                    r.score = score;
-                    r
-                })
-                .collect()
-        }
-        Err(e) => {
-            warn!(
-                "Reranking failed (provider={:?}): {}. Falling back to RRF order.",
-                config.provider, e
-            );
-            rerank_input.into_iter().take(top_k).collect()
-        }
-    }
+    Ok(scored
+        .into_iter()
+        .take(top_k)
+        .map(|(score, mut r)| {
+            r.score = score;
+            r
+        })
+        .collect())
 }
 
 /// Build the batched reranking prompt.
@@ -200,20 +156,7 @@ fn parse_scores(response: &str, expected_count: usize) -> Result<Vec<f64>> {
 
 // ── Claude Code SDK adapter ───────────────────────────────────────────────
 
-pub struct ClaudeCodeReranker {
-    model: String,
-}
-
-impl ClaudeCodeReranker {
-    fn from_config(config: &RerankConfig) -> Self {
-        let model = config
-            .claude_code
-            .as_ref()
-            .map(|c| c.model.clone())
-            .unwrap_or_else(|| "haiku".to_string());
-        Self { model }
-    }
-}
+pub struct ClaudeCodeReranker;
 
 #[async_trait]
 impl Reranker for ClaudeCodeReranker {
@@ -224,13 +167,13 @@ impl Reranker for ClaudeCodeReranker {
         debug!(
             "Reranking {} candidates via claude-code SDK (model={})",
             candidates.len(),
-            self.model
+            RERANK_MODEL
         );
 
         let mut options = ClaudeAgentOptions::builder()
             .permission_mode(PermissionMode::BypassPermissions)
             .build();
-        options.model = Some(self.model.clone());
+        options.model = Some(RERANK_MODEL.to_string());
 
         let prompt = build_rerank_prompt(query, candidates);
 
@@ -303,216 +246,6 @@ impl Reranker for ClaudeCodeReranker {
     }
 }
 
-// ── Anthropic API adapter ─────────────────────────────────────────────────
-
-pub struct AnthropicReranker {
-    api_key: String,
-    model: String,
-    max_concurrent: usize,
-}
-
-impl AnthropicReranker {
-    fn from_config(config: &RerankConfig) -> Result<Self> {
-        let api_config = config.anthropic.as_ref().context(
-            "Reranking provider is 'anthropic' but [reranking.anthropic] config is missing",
-        )?;
-
-        let api_key_env = api_config
-            .api_key_env
-            .as_deref()
-            .unwrap_or("ANTHROPIC_API_KEY");
-        let api_key = std::env::var(api_key_env).with_context(|| {
-            format!(
-                "Reranking provider 'anthropic' requires {} environment variable",
-                api_key_env
-            )
-        })?;
-
-        let model = api_config
-            .model
-            .clone()
-            .unwrap_or_else(|| "claude-haiku-4-5-20251001".to_string());
-        let max_concurrent = api_config.max_concurrent.unwrap_or(10);
-
-        Ok(Self {
-            api_key,
-            model,
-            max_concurrent,
-        })
-    }
-}
-
-#[async_trait]
-impl Reranker for AnthropicReranker {
-    async fn score(&self, query: &str, candidates: &[SearchResult]) -> Result<Vec<f64>> {
-        debug!(
-            "Reranking {} candidates via Anthropic API (model={}, max_concurrent={})",
-            candidates.len(),
-            self.model,
-            self.max_concurrent
-        );
-
-        let client = reqwest::Client::new();
-        let mut tasks = tokio::task::JoinSet::new();
-
-        for (i, result) in candidates.iter().enumerate() {
-            let prompt = format!(
-                "Rate relevance 0-10. Reply with ONLY the number.\n\n\
-                 Query: {}\nDocument: {}",
-                query,
-                result.content.chars().take(500).collect::<String>()
-            );
-            let client = client.clone();
-            let key = self.api_key.clone();
-            let model = self.model.clone();
-
-            tasks.spawn(async move {
-                let resp = client
-                    .post("https://api.anthropic.com/v1/messages")
-                    .header("x-api-key", &key)
-                    .header("anthropic-version", "2023-06-01")
-                    .json(&serde_json::json!({
-                        "model": model,
-                        "max_tokens": 4,
-                        "messages": [{"role": "user", "content": prompt}]
-                    }))
-                    .send()
-                    .await
-                    .with_context(|| format!("Anthropic API request failed for candidate {}", i))?;
-
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    bail!(
-                        "Anthropic API returned {} for candidate {}: {}",
-                        status,
-                        i,
-                        body
-                    );
-                }
-
-                let body = resp.json::<serde_json::Value>().await.with_context(|| {
-                    format!("Failed to parse Anthropic response for candidate {}", i)
-                })?;
-
-                let score_text = body["content"][0]["text"].as_str().with_context(|| {
-                    format!(
-                        "Anthropic response for candidate {} missing content[0].text: {:?}",
-                        i, body
-                    )
-                })?;
-
-                let score: f64 = score_text.trim().parse().with_context(|| {
-                    format!(
-                        "Failed to parse Anthropic score for candidate {} ({:?})",
-                        i, score_text
-                    )
-                })?;
-
-                Ok::<(usize, f64), anyhow::Error>((i, score.clamp(0.0, 10.0)))
-            });
-        }
-
-        let mut scores = vec![0.0f64; candidates.len()];
-        let mut errors = Vec::new();
-
-        while let Some(result) = tasks.join_next().await {
-            match result {
-                Ok(Ok((idx, score))) => {
-                    scores[idx] = score;
-                }
-                Ok(Err(e)) => {
-                    errors.push(format!("{}", e));
-                }
-                Err(e) => {
-                    errors.push(format!("Task panicked: {}", e));
-                }
-            }
-        }
-
-        if !errors.is_empty() {
-            let total = candidates.len();
-            let failed = errors.len();
-            if failed == total {
-                bail!(
-                    "All {} Anthropic API rerank calls failed. First error: {}",
-                    total,
-                    errors[0]
-                );
-            }
-            warn!(
-                "{}/{} Anthropic rerank calls failed. First error: {}",
-                failed, total, errors[0]
-            );
-        }
-
-        Ok(scores)
-    }
-}
-
-// ── Ollama adapter ────────────────────────────────────────────────────────
-
-pub struct OllamaReranker {
-    url: String,
-    model: String,
-}
-
-impl OllamaReranker {
-    fn from_config(config: &RerankConfig) -> Self {
-        let ollama_config = config.ollama.as_ref();
-        let url = ollama_config
-            .and_then(|c| c.url.clone())
-            .unwrap_or_else(|| "http://localhost:11434".to_string());
-        let model = ollama_config
-            .and_then(|c| c.model.clone())
-            .unwrap_or_else(|| "qwen2.5:1.5b".to_string());
-        Self { url, model }
-    }
-}
-
-#[async_trait]
-impl Reranker for OllamaReranker {
-    async fn score(&self, query: &str, candidates: &[SearchResult]) -> Result<Vec<f64>> {
-        debug!(
-            "Reranking {} candidates via Ollama (url={}, model={})",
-            candidates.len(),
-            self.url,
-            self.model
-        );
-
-        let prompt = build_rerank_prompt(query, candidates);
-
-        let client = reqwest::Client::new();
-        let resp = client
-            .post(format!("{}/api/generate", self.url))
-            .json(&serde_json::json!({
-                "model": self.model,
-                "prompt": prompt,
-                "stream": false,
-            }))
-            .send()
-            .await
-            .context("Ollama reranking request failed")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            bail!("Ollama returned {} for reranking: {}", status, body);
-        }
-
-        let body = resp
-            .json::<serde_json::Value>()
-            .await
-            .context("Failed to parse Ollama response")?;
-
-        let text = body["response"]
-            .as_str()
-            .context("Ollama response missing 'response' field")?;
-
-        parse_scores(text, candidates.len())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,8 +261,6 @@ mod tests {
             date: None,
             date_source: None,
             section: None,
-            project: None,
-            memory_type: None,
             status: None,
             collection_name: None,
             collection_description: None,
@@ -540,18 +271,6 @@ mod tests {
         (0..n)
             .map(|i| make_result(&format!("doc{}.md", i), &format!("content {}", i), 1.0))
             .collect()
-    }
-
-    fn rerank_config(top_k: usize, candidates: usize) -> RerankConfig {
-        RerankConfig {
-            enabled: true,
-            provider: "test".into(),
-            candidates,
-            top_k,
-            claude_code: None,
-            anthropic: None,
-            ollama: None,
-        }
     }
 
     type FakeBehavior = dyn FnMut(&str, &[SearchResult]) -> Result<Vec<f64>> + Send;
@@ -649,9 +368,8 @@ mod tests {
             Ok(vec![3.0, 9.0, 1.0, 7.0, 5.0])
         });
         let candidates = make_candidates(5);
-        let cfg = rerank_config(3, 5);
 
-        let out = rerank_with(&fake, "q", candidates, &cfg).await;
+        let out = rerank_with(&fake, "q", candidates, 3).await.unwrap();
 
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].file_path, "doc1.md");
@@ -663,100 +381,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rerank_with_falls_back_on_score_count_mismatch() {
+    async fn rerank_with_errors_on_score_count_mismatch() {
         let fake = FakeReranker::new(|_, _| Ok(vec![1.0, 2.0])); // expected 5
         let candidates = make_candidates(5);
-        let cfg = rerank_config(3, 5);
 
-        let out = rerank_with(&fake, "q", candidates.clone(), &cfg).await;
+        let err = rerank_with(&fake, "q", candidates, 3)
+            .await
+            .expect_err("count mismatch must not degrade to RRF order");
 
-        assert_eq!(out.len(), 3);
-        // Fallback preserves RRF order: doc0, doc1, doc2.
-        for (i, r) in out.iter().enumerate() {
-            assert_eq!(r.file_path, format!("doc{}.md", i));
-        }
+        assert!(
+            err.to_string().contains("2 scores for 5 candidates"),
+            "Error should report the counts: {}",
+            err
+        );
     }
 
     #[tokio::test]
-    async fn rerank_with_falls_back_when_all_scores_invalid() {
-        let fake = FakeReranker::new(|_, _| Ok(vec![-1.0, -2.0, -3.0]));
-        let candidates = make_candidates(3);
-        let cfg = rerank_config(3, 3);
-
-        let out = rerank_with(&fake, "q", candidates, &cfg).await;
-
-        assert_eq!(out.len(), 3);
-        for (i, r) in out.iter().enumerate() {
-            assert_eq!(r.file_path, format!("doc{}.md", i));
-            assert_eq!(r.score, 1.0); // RRF score preserved
-        }
-    }
-
-    #[tokio::test]
-    async fn rerank_with_falls_back_on_provider_error() {
+    async fn rerank_with_propagates_provider_error() {
         let fake = FakeReranker::new(|_, _| bail!("boom"));
         let candidates = make_candidates(4);
-        let cfg = rerank_config(2, 4);
 
-        let out = rerank_with(&fake, "q", candidates, &cfg).await;
+        let err = rerank_with(&fake, "q", candidates, 2)
+            .await
+            .expect_err("provider failure must not degrade to RRF order");
 
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].file_path, "doc0.md");
-        assert_eq!(out[1].file_path, "doc1.md");
+        assert_eq!(err.to_string(), "Reranking failed");
+        assert_eq!(err.root_cause().to_string(), "boom");
     }
 
     #[tokio::test]
     async fn rerank_with_returns_empty_for_no_candidates() {
         let fake = FakeReranker::new(|_, _| panic!("should not be called"));
-        let cfg = rerank_config(5, 20);
-        let out = rerank_with(&fake, "q", vec![], &cfg).await;
+        let out = rerank_with(&fake, "q", vec![], 5).await.unwrap();
         assert!(out.is_empty());
     }
 
     #[tokio::test]
-    async fn rerank_with_caps_input_at_candidates_config() {
-        // 10 candidates, config.candidates=4 → only 4 are scored, top_k=2 returned.
+    async fn rerank_with_scores_every_candidate_it_is_given() {
+        // The pipeline decides the candidate count by over-fetching; this
+        // function never silently drops part of what it was handed.
         let fake = FakeReranker::new(|_, c| {
-            assert_eq!(c.len(), 4, "should only score first 4 candidates");
-            Ok(vec![1.0, 9.0, 2.0, 5.0])
+            assert_eq!(c.len(), 10, "every candidate must be scored");
+            Ok((0..10).map(|i| i as f64).collect())
         });
         let candidates = make_candidates(10);
-        let cfg = rerank_config(2, 4);
 
-        let out = rerank_with(&fake, "q", candidates, &cfg).await;
+        let out = rerank_with(&fake, "q", candidates, 2).await.unwrap();
 
         assert_eq!(out.len(), 2);
-        assert_eq!(out[0].file_path, "doc1.md");
-        assert_eq!(out[1].file_path, "doc3.md");
-    }
-
-    #[test]
-    fn build_reranker_rejects_unknown_provider() {
-        let cfg = RerankConfig {
-            enabled: true,
-            provider: "nonsense".into(),
-            candidates: 5,
-            top_k: 3,
-            claude_code: None,
-            anthropic: None,
-            ollama: None,
-        };
-        let err = build_reranker(&cfg).err().expect("expected error");
-        assert!(err.to_string().contains("Unknown reranking provider"));
-    }
-
-    #[test]
-    fn build_reranker_anthropic_requires_config() {
-        let cfg = RerankConfig {
-            enabled: true,
-            provider: "anthropic".into(),
-            candidates: 5,
-            top_k: 3,
-            claude_code: None,
-            anthropic: None,
-            ollama: None,
-        };
-        let err = build_reranker(&cfg).err().expect("expected error");
-        assert!(err.to_string().contains("[reranking.anthropic]"));
+        assert_eq!(out[0].file_path, "doc9.md");
+        assert_eq!(out[1].file_path, "doc8.md");
     }
 }

@@ -4,22 +4,24 @@ Project-level guidance for the recall semantic memory search CLI.
 
 ## Build Commands
 
+This repo has its own flake, and its dev shell carries the whole toolchain —
+`cargo`, `rustfmt`, `clippy`. Use it rather than a sibling project's shell:
+aria's shell has no rustfmt or clippy, so two of the four CI gates cannot run
+in it.
+
 ```bash
-# Build (requires nix develop from aria for Rust toolchain)
-cd recall && nix develop ~/aria/aria --command cargo build
-
-# Run tests
-nix develop ~/aria/aria --command cargo test
-
-# Lint
-nix develop ~/aria/aria --command cargo clippy
-
-# Format
-nix develop ~/aria/aria --command cargo fmt
+nix develop --command cargo build
+nix develop --command cargo test --locked --all-targets
+nix develop --command cargo fmt --all -- --check
+nix develop --command cargo clippy --all-targets --locked -- -D warnings
 
 # Accept a deliberate ranking change (rewrites tests/snapshots/ranking.json)
-RECALL_UPDATE_SNAPSHOTS=1 nix develop ~/aria/aria --command cargo test --test ranking
+RECALL_UPDATE_SNAPSHOTS=1 nix develop --command cargo test --test ranking
 ```
+
+Those four commands are exactly what CI runs, on ubuntu and macos. CI installs
+the toolchain with rustup instead of Nix; a separate workflow runs
+`nix build .` so the flake cannot rot.
 
 ## Project Structure
 
@@ -32,23 +34,22 @@ recall/
 │   ├── ast.rs        # comrak AST chunker (structure only)
 │   ├── chunker.rs    # File-level chunk metadata (date cascade, type, status)
 │   ├── frontmatter.rs# Minimal YAML frontmatter scalar scanner
-│   ├── intent.rs     # Heuristic query intent classifier (--auto routing)
-│   ├── config.rs     # TOML configuration: search, reranking, decay, lint
+│   ├── intent.rs     # Temporal query detection (year extraction, decay skip)
 │   ├── embedder.rs   # Ollama HTTP client for embeddings
-│   ├── reranker.rs   # LLM reranking (claude-code SDK, Anthropic API, Ollama)
+│   ├── reranker.rs   # LLM reranking (claude-agent-sdk)
 │   ├── lint.rs       # Vault link linter (dangling wikilinks, orphaned notes)
 │   ├── mcp.rs        # MCP stdio server (recall_search, recall_index, recall_status)
 │   └── watcher.rs    # File system watcher (notify-rs)
 ├── tests/
-│   ├── common/       # RecallSandbox: hermetic RECALL_DB_PATH / RECALL_CONFIG_PATH
+│   ├── common/       # RecallSandbox: hermetic RECALL_DB_PATH
 │   ├── ranking.rs    # Retrieval regression harness (snapshot + labeled queries)
 │   ├── snapshots/    # Checked-in ranking baseline
 │   ├── indexing.rs   # Date cascade, chunk metadata, search date bounds
 │   ├── decay.rs      # Recency decay end-to-end
 │   ├── collections.rs# Collection CRUD and half-life
-│   ├── lint.rs       # Link states, orphans, --out guard
+│   ├── lint.rs       # Link resolution, orphans
 │   ├── mcp.rs        # MCP protocol surface over stdio
-│   ├── maintenance.rs# check / vacuum / rebuild-fts
+│   ├── maintenance.rs# vacuum / rebuild-fts
 │   └── cli.rs        # Command dispatch and output formats
 ├── Cargo.toml
 └── README.md
@@ -56,36 +57,55 @@ recall/
 
 ## Architecture
 
-- **Search** (`search.rs`): the whole pipeline behind one function, `search()`. Intent classification, `--auto` routing, BM25 / vector / RRF fusion, optional reranking, recency decay. The CLI and the MCP server both call it, so the rules ("fetch `candidates` when reranking", "fall back to BM25 when no embeddings exist") exist once, not per call site. Renders nothing — callers format the `SearchOutcome`.
-- **Store** (`store.rs`): SQLite database with FTS5 for BM25 search and sqlite-vec for vector KNN search. Persistence and query only; chunking moved out to `ast.rs` / `chunker.rs`.
+- **Search** (`search.rs`): the whole pipeline behind one function, `search()`. BM25 / vector / RRF fusion, optional reranking, recency decay. The CLI and the MCP server both call it, so the rules ("fetch `RERANK_CANDIDATES` when reranking", "fall back to BM25 when no embeddings exist") exist once, not per call site. Renders nothing — callers format the `SearchOutcome`.
+- **Store** (`store.rs`): SQLite database with FTS5 for BM25 search and sqlite-vec for vector KNN search. Persistence and query only; chunking moved out to `ast.rs` / `chunker.rs`. Also owns `EXCLUDE_GLOBS` / `is_excluded()` — the one list of paths that are not notes, obeyed by the indexer, the linter, and the watcher alike.
 - **AST chunker** (`ast.rs`): comrak-based splitter. Groups top-level blocks into chunks on heading boundaries (any level) and a soft 1600-char cap, but only ever cuts *between* blocks — a code block, list, or table is never torn. No overlap between chunks.
-- **Chunker** (`chunker.rs`): wraps `ast.rs` with the file-level metadata stamped onto every chunk from a file — the date cascade, `memory_type`, and frontmatter `status`. Its heuristics are private and unit-tested in isolation.
-- **Intent** (`intent.rs`): pure-heuristic classifier, no LLM call, so latency stays predictable. Buckets a query as `lookup` / `exploratory` / `temporal` / `structural`. It never changes behaviour by itself; `--auto` is what opts into the routing (exploratory ⇒ hybrid + rerank, temporal ⇒ `--after` from the extracted year).
-- **Config** (`config.rs`): TOML config from `~/.config/recall/config.toml`. Includes `[reranking]` with per-provider settings, `[decay]` for recency ranking, and `[lint]`.
-- **Frontmatter** (`frontmatter.rs`): hand-rolled scanner for the leading `---` block. Reads flat scalars only (`date`, `last_updated`, `created`, `updated`, `status`, `type`, `aliases`). No `serde_yaml` — it is unmaintained.
-- **Embedder** (`embedder.rs`): HTTP client for Ollama embedding API (nomic-embed-text, 768-dim)
-- **Reranker** (`reranker.rs`): LLM-based reranking with 3 configurable providers:
-  - `claude-code` (default): Uses `claude-agent-sdk` crate. No API key needed. Batches all candidates into one prompt.
-  - `anthropic`: Direct Anthropic Messages API. Parallel calls, needs `ANTHROPIC_API_KEY`.
-  - `ollama`: Local model fallback for offline use.
+- **Chunker** (`chunker.rs`): wraps `ast.rs` with the file-level metadata stamped onto every chunk from a file — the date cascade and frontmatter `status`. Its heuristics are private and unit-tested in isolation.
+- **Intent** (`intent.rs`): two string-inspection functions, no LLM call, so latency stays predictable. `year()` pulls a 2000-2099 year out of the query, which becomes an `after` bound; `is_temporal()` says whether the query asks about a point in time, which skips recency decay. It used to classify into four buckets, two of which routed nothing and one of which — `structural` — was checked first and actively harmful: `*.md from 2025` matched it and lost both the year bound and the decay skip. Reranking is never routed; it costs seconds, so only `--rerank` turns it on.
+- **Frontmatter** (`frontmatter.rs`): hand-rolled scanner for the leading `---` block. Reads flat scalars only (`date`, `last_updated`, `status`, `type`, `aliases`). No `serde_yaml` — it is unmaintained.
+- **Embedder** (`embedder.rs`): HTTP client for Ollama embedding API. `EMBEDDING_MODEL` (nomic-embed-text, 768-dim) is a const because it is half the index fingerprint; the server URL honors `RECALL_OLLAMA_URL`.
+- **Reranker** (`reranker.rs`): LLM-based reranking through the `claude-agent-sdk` crate. No API key needed; all candidates go into one prompt. Reranking failures propagate as errors — degrading to RRF order is invisible to the caller, and over MCP the warning never reaches the model.
 - **MCP** (`mcp.rs`): Model Context Protocol server over stdio. Exposes 3 tools: `recall_search`, `recall_index`, `recall_status`, plus dynamic server instructions on `initialize`. Registered in ARIA's Claude Code MCP config.
-- **Lint** (`lint.rs`): `recall lint` — reads the vault from disk (never the index) and reports dangling wikilinks and orphaned notes. See "Linting" below.
-- **Watcher** (`watcher.rs`): File system watcher with debouncing for auto-indexing
+- **Lint** (`lint.rs`): `recall lint` — reads the vault from disk (never the index) and reports dangling wikilinks and orphaned notes. A link resolves against *every* registered collection, so a cross-project link is not a finding. See "Linting" below.
+- **Watcher** (`watcher.rs`): notify-rs over every collection's `root_path`, debounced by `DEBOUNCE_MS`. It re-indexes a changed `.md` file into the collection that owns it. It does **not** notice deletions — an event whose path no longer exists is skipped, so only `recall index` (or the `recall_index` tool) prunes a removed note. That is the one job the watcher does not cover.
 
 ## Database
 
-Tables: `collections`, `files`, `chunks`, `fts_chunks` (FTS5), `vec_embeddings` (vec0), `config`
+Location: `~/.local/share/recall/memory.sqlite`. `RECALL_DB_PATH` overrides it.
 
-Location: `~/.local/share/recall/memory.sqlite`
+| Table | Columns |
+|---|---|
+| `collections` | `id`, `name` (unique), `root_path`, `description`, `half_life_days`, `created_at` |
+| `files` | `id`, `collection_id`, `file_path`, `mtime`, `indexed_at`, `chunk_count`, `UNIQUE(collection_id, file_path)` |
+| `chunks` | `id`, `file_id`, `collection_id`, `date`, `date_source`, `section`, `status`, `start_line`, `end_line`, `content` |
+| `fts_chunks` | FTS5 external-content over `chunks.content`, synced by three triggers |
+| `vec_embeddings` | vec0, `float[768]`, rowid = `chunks.id` |
+| `config` | `key`, `value` — holds `index_fingerprint` and nothing else |
 
-No migration code by design. `config['index_fingerprint']` holds
-`schema=<n>;chunker=<n>;embedding=<model>`, built from `SCHEMA_VERSION`,
-`CHUNKER_VERSION`, and `config.embeddings.model`. On a mismatch, `Store::open`
-drops `files` / `chunks` / `fts_chunks` / `vec_embeddings` and the next
-`recall index` rebuilds them. Collections survive the rebuild.
+`chunks.collection_id` is denormalized from `files` so a collection-scoped
+search filters without a join. Three columns are gone: `memory_type` (path
+heuristics restating what `file_path` already said, never filtered or ranked
+on), `project` (hardcoded `None` at every write, so it never held a value), and
+`chunk_index` (written, never read).
 
-**A schema or chunker change therefore costs a full reindex, plus a full
-`recall embed`.** Bump `SCHEMA_VERSION` when the table shape changes and
+Indexes are `idx_chunks_file_id`, `idx_chunks_collection_id`, and
+`idx_files_collection_id` — the three that back a real predicate. Indexes on
+`chunks.date` and `files.mtime` were dropped: both columns are only ever
+residual filters on rows already fetched by `fts_chunks MATCH` or `id IN (...)`,
+so the planner never chose them and they cost every insert.
+
+No migration code by design, and the fingerprint is the *only* compatibility
+mechanism — there is no second check that refuses to open an old database.
+`config['index_fingerprint']` holds
+`schema=<n>;chunker=<n>;embedding=<model>`, built from `SCHEMA_VERSION`
+(currently 3, bumped when the three columns above were dropped),
+`CHUNKER_VERSION` (currently 3), and `EMBEDDING_MODEL`. On a mismatch,
+`Store::open` drops `files` / `chunks` / `fts_chunks` / `vec_embeddings` and
+the next `recall index` rebuilds them. Collections survive the rebuild.
+
+**A schema or chunker change therefore costs a full reindex plus a full
+`recall embed`** — the vectors go with the chunks, and re-embedding a real
+vault is the slow half. Bump `SCHEMA_VERSION` when the table shape changes and
 `CHUNKER_VERSION` when the chunker's output would differ for unchanged input.
 Never write `ALTER TABLE` or a `migrate_*` helper.
 
@@ -95,51 +115,77 @@ A chunk's `date` comes from a cascade — frontmatter `date:` /
 
 ## Key Patterns
 
-- Hybrid search uses **Reciprocal Rank Fusion (RRF)** with configurable `rrf_k` parameter
+- Hybrid search uses **Reciprocal Rank Fusion (RRF)** with `RRF_K = 60`, the constant from the RRF paper
 - LLM reranking batches all candidates into one prompt for efficiency (1 LLM call per search)
 - Chunking splits on headings and a soft 1600-char cap, always at an AST block boundary. No overlap between chunks.
 - FTS5 is kept in sync via triggers on the `chunks` table
 - MCP server uses JSON-RPC over newline-delimited JSON on stdio
-- All reranker error paths log diagnostics and fall back to RRF order (no silent failures)
+- Every reranker error path propagates. Degraded-but-plausible results are worse than an error the caller can see.
+- The same rule holds for the store. No `COUNT(*)` is `unwrap_or(0)`, hydration
+  propagates a DB error instead of skipping the hit, and a failed embedding
+  delete fails the re-index. A corrupt database that reports itself as empty is
+  indistinguishable from a fresh install, and every consumer draws the wrong
+  conclusion from that. The one exception is the chunk count inside
+  `check_index_fingerprint`, which runs before `init_schema` and so may
+  legitimately find no `chunks` table; it is commented as such.
 
 ## Search Pipeline
 
 ```
-Query → Intent classify → [--auto routing] → BM25 [+ Vector → RRF Fusion]
-      → [LLM Reranker] → truncate to limit → [Recency Decay] → Results
+Query → [year → after bound] → BM25 + Vector → RRF Fusion
+      → [LLM Reranker] → truncate to limit → Recency Decay → Results
 ```
 
-One implementation, in `search.rs::search_with_store`. Use `--hybrid` for
-BM25+vector, `--rerank` for LLM reranking, `--auto` to let the classifier pick
-both, or any combination. Intent is always classified — `--auto` only decides
-whether it changes parameters — and it is reported by `--trace`.
+One implementation, in `search.rs::search_with_store`, and one retrieval
+strategy: hybrid, always. There is no `--hybrid` flag because the fusion is
+strictly better wherever vectors exist, and only the index knows whether they
+do — with zero embeddings the pipeline degrades to BM25 on its own, so search
+works before `recall embed` has ever run.
 
-Hybrid silently falls back to BM25 when the index has zero embeddings, so
-`--hybrid` is safe to pass before `recall embed` has ever run.
+`--rerank` is the one retrieval knob the caller still holds, and it is the only
+thing that turns reranking on: nothing routes to it, because it costs seconds
+of LLM latency. Asking for it makes the pipeline over-fetch
+`RERANK_CANDIDATES` before fusion. **A reranking failure is an error, not a
+silent downgrade.** An unreachable model, or one that returns the wrong number
+of scores, fails the search rather than returning RRF order — a caller who
+asked for reranking and got unreranked results has no way to tell, and over
+MCP the `warn!` never reaches the model.
 
-`SearchOptions` (`after` / `before` / `project` / `file_pattern` /
-`collection_id`) applies to **both** candidate lists before RRF fusion, not
-just to the hydrated output — filtering after fusion would return fewer than
-`limit`. `SearchOptions::is_filtered()` derives "is any filter set" from the
-same place `append_filters` reads the fields, so adding a filter cannot leave
-the vector path unpruned (that bug shipped once, for `before`).
+`SearchOptions` (`after` / `before` / `collection_id`)
+applies to **both** candidate lists before RRF fusion, not just to the
+hydrated output — filtering after fusion would return fewer than `limit`. The
+vector path over-fetches and prunes unconditionally; an "is any filter set"
+shortcut has to restate `append_filters`'s field list by hand, and the stale
+copy shipped a bug once (`before` was pruned nowhere).
 
-Recency decay is **off by default** (`[decay] enabled = false`). It runs last,
-in `search.rs::apply_decay`, on the already-reranked and truncated list:
+Recency decay is **unconditional**. It runs last, in `search.rs::apply_decay`,
+on the already-reranked and truncated list:
 `score *= 0.5 + 0.5 * exp(-ln2 * age_days / half_life_days)`. The floor of
 0.5 is deliberate — recency separates comparable results and never beats
-relevance. Half-life is **per collection**: the collection's own
-`half_life_days` if it has one, else `config.decay.default_half_life_days`.
-Skipped for undated chunks (no evidence of age is not evidence of staleness)
-and for `Intent::Temporal` queries, which ask for old material on purpose.
-Dates are kept **out** of the rerank prompt so the arithmetic is the only
-recency authority. `--trace` reports `decay_factor` and `pre_decay_score`.
+relevance. It was a config switch defaulting to off, which meant the ranking
+everyone actually got was the worse one: the labeled query set scores 14/16
+without decay and 16/16 with it. Half-life is **per collection**: the
+collection's own `half_life_days` if it has one, else the
+`DEFAULT_HALF_LIFE_DAYS` const (90 days) in `search.rs`.
+
+Two skips survive, because they are behaviour rather than configuration:
+undated chunks (no evidence of age is not evidence of staleness) and temporal
+queries, which ask for old material on purpose. Dates are kept **out** of the
+rerank prompt so the arithmetic is the only recency authority. `--trace`
+reports `decay_factor` and `pre_decay_score`.
 
 ## Ranking Regression Harness
 
 `tests/ranking.rs` is the baseline for every future ranking change. It
 builds a 14-note fixture vault in a temp dir, indexes it, and runs 24 fixed
-queries twice — decay off, then decay on. BM25-only, so CI needs no Ollama.
+queries. BM25-only, so CI needs no Ollama.
+
+Decay is unconditional, so there is no second profile to run. The comparison
+the old "decay off" profile provided comes from `--trace` instead:
+`pre_decay_score` is the score the pipeline would have returned without decay,
+so sorting on it reconstructs the pre-decay ranking from the *same* search.
+That is a stronger baseline — it is measured from the shipped code path rather
+than from a second one.
 
 Two guards:
 
@@ -149,12 +195,12 @@ Two guards:
   surprise. Regenerate only on purpose:
   `RECALL_UPDATE_SNAPSHOTS=1 cargo test --test ranking`. Review that diff —
   it is the record of what the change did.
-- **Labeled queries.** 16 queries with a known-correct top result, scored as
-  a hit rate. Measured: **14/16 with decay off, 16/16 with decay on.** The
-  two it fixes are supersession pairs (a keyword-dense superseded decision
-  record against the short note that overturned it). That gap is the reason
-  decay exists; the test asserts the miss list exactly, so a fixture drift
-  that erases the gap fails loudly instead of quietly passing.
+- **Labeled queries.** 16 queries with a known-correct top result. Measured:
+  **16/16 as ranked, 14/16 in pre-decay order.** The two decay fixes are
+  supersession pairs (a keyword-dense superseded decision record against the
+  short note that overturned it). That gap is the reason decay exists; the
+  test asserts the miss list exactly, so a fixture drift that erases the gap
+  fails loudly instead of quietly passing.
 
 Fixture dates are written relative to today, so the corpus keeps its ages
 forever and the snapshot cannot rot. Filenames are deliberately not
@@ -163,63 +209,61 @@ date cascade).
 
 ## Configuration
 
-Config at `~/.config/recall/config.toml`. Key sections:
+There is none. Recall reads no config file, and `config.rs` is deleted. Every
+value that was a key is now either a const next to the code that would be
+re-measured if it changed, or a column the database owns:
 
-```toml
-[search]
-default_limit = 5
-rrf_k = 60
+| Const | Where | Value |
+|---|---|---|
+| `RRF_K` | `store.rs` | 60 — from the RRF paper |
+| `EXCLUDE_GLOBS` | `store.rs` | Templates, `.obsidian`, attachments, sync conflicts |
+| `EMBEDDING_MODEL` | `embedder.rs` | `nomic-embed-text` — half the index fingerprint |
+| `RERANK_CANDIDATES` | `search.rs` | 20 — what fits in one rerank prompt |
+| `DEFAULT_HALF_LIFE_DAYS` | `search.rs` | 90 |
+| `RERANK_MODEL` | `reranker.rs` | `haiku` |
+| `DEBOUNCE_MS` | `watcher.rs` | 1500 |
+| `ORPHAN_EXCLUDE` | `lint.rs` | daily notes, journals, session logs |
 
-[reranking]
-enabled = false              # or use --rerank flag
-provider = "claude-code"     # "claude-code" | "anthropic" | "ollama"
-candidates = 20
-top_k = 5
+Two environment variables change behaviour: `RECALL_DB_PATH` (also what makes
+the test suite hermetic) and `RECALL_OLLAMA_URL` (a remote GPU box is the one
+plausible second value). `RUST_LOG` filters tracing to stderr, default `warn`,
+and `RECALL_UPDATE_SNAPSHOTS` is test-only. `--limit` defaults to 5 at the clap
+layer, and the MCP `limit` argument defaults to 5 in `tool_search`.
 
-[reranking.claude_code]
-model = "haiku"
+The file never existed on the machine this runs on, so all 22 keys had only
+ever held their compiled-in defaults — and `[index] paths` made `recall status`
+report a path that had nothing to do with where the collections pointed. A knob
+nobody turns is a second place for the answer to live.
 
-[decay]
-enabled = false              # recency-aware ranking; OFF unless set
-default_half_life_days = 90.0  # fallback for collections with no half-life
-
-[lint]
-# Globs never reported as orphans (still scanned for links).
-orphan_exclude = [
-  "**/daily/**", "**/journal/**", "**/sessions/**",
-  "**/session-*.md", "**/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*.md",
-]
-```
-
-Per-collection half-life lives in the DB, not the TOML — it is a property of
-the corpus, and one config file covers several corpora with different rates of
-change:
+Per-collection half-life lives in the DB — it is a property of the corpus, and
+one machine covers several corpora with different rates of change:
 
 ```bash
-recall collection add ~/notes --name notes --half-life-days 30
-recall collection half-life notes 30   # set or replace
-recall collection half-life notes      # clear; falls back to default_half_life_days
+recall collection half-life notes 30   # set or replace (must be positive)
+recall collection half-life notes      # clear; falls back to DEFAULT_HALF_LIFE_DAYS
 ```
+
+`collection half-life` is the column's only writer, which is why its `days > 0`
+check is the only one: `recency_factor` divides by the half-life and carries no
+guard of its own. `collection describe <name> [text]` has the same shape over
+`collections.description`.
 
 ## Linting
 
-`recall lint [--collection <name>] [--json] [--out <path>] [--fail-on-unresolved]`
+`recall lint [--collection <name>] [--json]`
 
 Reads the filesystem, not the index, so the answer never goes stale with the
 index. It writes nothing and it **never runs as part of indexing** — with no
 migration path, an index that aborts on a link typo is a self-inflicted outage.
-Exit code is 0 unless `--fail-on-unresolved` is passed.
+Findings never change the exit code: lint warns, it does not gate, and there is
+no `--fail-on-unresolved`. Only a usage error exits nonzero.
 
-Three link states (only the last is a finding):
-
-| State | Meaning |
-|---|---|
-| `resolved-local` | Target is in the same collection. |
-| `resolved-foreign` | Target is in another registered collection. Cross-project links are valid; they are listed for visibility, not flagged. |
-| `unresolved` | Target found nowhere. |
-
-Every collection is always scanned; `--collection` only narrows what is
-reported. Resolution matches note basenames **and** frontmatter `aliases:` —
+A link is **resolved** when any registered collection holds the target, and
+**unresolved** when none does. Only unresolved is a finding. There used to be a
+third state, `resolved-foreign`, with its own report section listing links that
+are correct — the valuable part is resolving across collections, which needs no
+state to record. Every collection is always scanned; `--collection` only
+narrows what is reported. Resolution matches note basenames **and** frontmatter `aliases:` —
 an alias-blind resolver reports the most-linked notes in the vault as dangling.
 
 Links come from the comrak AST, never a regex over raw text, so `[[Target]]`
@@ -228,39 +272,51 @@ inside a fenced block, inline code, raw HTML, or frontmatter is not a link.
 `%%` inside a code block cannot open a comment.
 
 An **orphan** is a note with zero incoming *and* zero outgoing wikilinks. The
-`[lint] orphan_exclude` globs (case-insensitive, matched against the absolute
-path) keep daily notes and session logs out of that list — they are unlinked by
+`ORPHAN_EXCLUDE` globs in `lint.rs` (case-insensitive, matched against the
+absolute path) keep daily notes and session logs out of that list — they are unlinked by
 design and would otherwise be the whole report.
 
-`--out` refuses any destination inside a collection root: a large report written
-into an indexed vault gets indexed, and in one case froze Obsidian.
+The report goes to stdout. Redirect it somewhere **outside** every collection
+root if you keep it: a large report written into an indexed vault gets indexed,
+and in one case froze Obsidian.
 
 ## MCP Server
 
-Start: `recall serve --mode mcp`
+Start: `recall serve`. It takes no flags — `--mode` had one legal value,
+validated against its own default. Anything still passing `--mode mcp` fails at
+argument parsing, so check the caller's nix config when the server will not
+start.
 
 Tools exposed:
 - `recall_search(query, limit?, rerank?, after?, before?, collection?)` — search the vault
-- `recall_index(collection?, path?)` — trigger incremental re-indexing
+- `recall_index(collection?, path?)` — reconcile the index with the filesystem
 - `recall_status()` — index health, collections, and stats
 
-The tool surface is deliberately narrower than the CLI's. `hybrid`,
-`rerank_provider`, `project`, and `file_pattern` are config or implementation
-detail; an agent cannot choose them well, so they are not exposed. Searches run
-with `auto: true`, so intent routing (and the temporal-query decay skip) applies
-over MCP exactly as it does with `recall search --auto`.
+The tool surface is deliberately narrower than the CLI's: `trace` is a
+diagnostic and retrieval strategy is not a choice an agent can make well, so
+neither is exposed. Both front ends now build the same `SearchRequest` and run
+the same pipeline, so an identical query ranks identically over MCP and on the
+CLI.
 
 `initialize` returns dynamic `instructions` built from live index state: file
 and chunk counts, collection names, capability gaps ("No vector embeddings;
 BM25-only…"), and the retrieval contract — results are dated digests, not live
 state; the newer date wins on conflict; volatile facts must be verified live.
 
-Every tool result is emitted on **both** MCP channels: `content[].text` and
-`structuredContent`. The Claude Code CLI forwards only the latter to the model,
-other clients only the former, so emitting one alone blanks the tool for half
-the ecosystem. `recall_search` also declares an `outputSchema`; each hit carries
-`path`, `line` (absolute, 1-indexed), `date`, `date_source`, `status`,
-`memory_type`, `collection`, `section`, `score`, `content`, with explicit
-`null` for unknowns.
+`recall_search` and `recall_status` emit their payload on **both** MCP
+channels: `content[].text` and `structuredContent`. The Claude Code CLI
+forwards only the latter to the model, other clients only the former, so
+emitting one alone blanks the tool for half the ecosystem. `recall_index` and
+every error are text-only — a one-line "Indexed N files" has no structure worth
+a second rendering.
+
+For `recall_search` the text channel is the structured payload pretty-printed.
+It used to be a hand-written prose renderer of the same nine fields, which also
+restated the retrieval contract and the `Read(path, offset=line-20)` hint that
+already reach the model through `instructions` and the tool description — three
+copies of two sentences, and a second formatter to keep in sync with the first.
+`recall_search` also declares an `outputSchema`; each hit carries `path`, `line`
+(absolute, 1-indexed), `date`, `date_source`, `status`, `collection`, `section`,
+`score`, `content`, with explicit `null` for unknowns.
 
 Registered in ARIA's Claude Code config at `~/.config/claude/settings.local.json`.

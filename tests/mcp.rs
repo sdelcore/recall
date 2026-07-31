@@ -1,9 +1,9 @@
 //! MCP (stdio JSON-RPC) integration tests.
 //!
-//! Spawns `recall serve --mode mcp`, drives the protocol over its stdin/stdout,
+//! Spawns `recall serve`, drives the protocol over its stdin/stdout,
 //! and asserts on response shape. No network, no LLM — the sandbox has no
-//! embeddings, so search falls back to BM25 and every query used here
-//! classifies as `Lookup`, which never turns the reranker on.
+//! embeddings, so search falls back to BM25, and nothing here passes
+//! `rerank`, which is the only thing that costs an LLM call.
 
 mod common;
 
@@ -25,7 +25,7 @@ impl McpClient {
     fn spawn(sandbox: &RecallSandbox) -> Self {
         let mut child = sandbox
             .raw_cmd()
-            .args(["serve", "--mode", "mcp"])
+            .arg("serve")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -222,7 +222,7 @@ fn mcp_search_schema_drops_hybrid_and_adds_before() {
         assert!(props.contains_key(expected), "missing param {expected}");
     }
     // Retrieval strategy is config, not a tool parameter.
-    for banned in ["hybrid", "rerank_provider", "project", "file_pattern"] {
+    for banned in ["hybrid", "file_pattern"] {
         assert!(!props.contains_key(banned), "param {banned} must not exist");
     }
     assert!(props["after"]["description"]
@@ -252,7 +252,6 @@ fn mcp_search_declares_annotations_and_output_schema() {
         "date",
         "date_source",
         "status",
-        "memory_type",
         "collection",
         "score",
     ] {
@@ -298,10 +297,14 @@ fn mcp_search_emits_both_channels_with_the_full_payload() {
     let resp = client.call_tool(2, "recall_search", json!({"query": "Paxos"}));
     let result = &resp["result"];
 
-    // Channel 1: text, for clients that forward only content[].text.
+    // Channel 1: text, for clients that forward only content[].text. It is
+    // the same payload pretty-printed, so it must parse and carry the same
+    // facts — not a second, hand-written rendering that can drift.
     let text = result["content"][0]["text"].as_str().expect("text channel");
+    let from_text: Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("text channel is not JSON: {e}\n{text}"));
+    assert_eq!(from_text, result["structuredContent"], "channels disagree");
     assert!(text.contains("gamma.md"), "text channel: {text}");
-    assert!(text.contains("newer date wins"), "text channel: {text}");
 
     // Channel 2: structuredContent, for the Claude Code CLI.
     let results = result["structuredContent"]["results"]

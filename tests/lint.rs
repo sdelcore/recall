@@ -10,13 +10,19 @@ use tempfile::{tempdir, TempDir};
 
 /// Two collections. `notes` links inside itself, into `work`, and at one note
 /// that does not exist; `work` holds the cross-collection target.
+///
+/// `index.md` carries frontmatter on purpose. Every note that feeds the date
+/// cascade has it, and comrak numbers the body of such a note from 1 rather
+/// than from the top of the file — so a fixture without frontmatter cannot
+/// catch a wrong reported line.
 fn two_vaults() -> (RecallSandbox, TempDir, TempDir) {
     let notes = tempdir().unwrap();
     let work = tempdir().unwrap();
 
     write(
         notes.path().join("index.md"),
-        "# Index\n\n\
+        "---\ndate: 2026-07-01\n---\n\
+         # Index\n\n\
          Local link to [[Alpha]] and a piped one to [[Beta|the beta note]].\n\n\
          By alias: [[Codename Alpha]].\n\n\
          Cross-project: [[Roadmap#Q3]].\n\n\
@@ -87,18 +93,23 @@ fn dangling_link_is_the_only_unresolved_finding() {
     let report = lint_json(&sandbox, Some("notes"));
 
     assert_eq!(targets(&report, "unresolved"), ["Missing Note"]);
-    assert_eq!(report["unresolved"][0]["state"], "unresolved");
-    assert_eq!(report["unresolved"][0]["line"].as_u64(), Some(9));
+    // File line, counted from the `---`, not from the first body line.
+    assert_eq!(report["unresolved"][0]["line"].as_u64(), Some(12));
 }
 
+/// A link into another registered collection is deliberate, not a finding.
+/// It used to get its own `resolved-foreign` state and a report section
+/// listing links that are correct; now it just resolves.
 #[test]
-fn cross_collection_link_resolves_as_foreign() {
+fn a_cross_collection_link_is_not_a_finding() {
     let (sandbox, _notes, _work) = two_vaults();
     let report = lint_json(&sandbox, Some("notes"));
 
-    assert_eq!(targets(&report, "foreign"), ["Roadmap"]);
-    assert_eq!(report["foreign"][0]["state"], "resolved-foreign");
-    assert_eq!(report["foreign"][0]["resolved_in"], "work");
+    assert!(
+        !targets(&report, "unresolved").contains(&"Roadmap".to_string()),
+        "cross-collection link reported as dangling"
+    );
+    assert!(report.get("foreign").is_none(), "{report}");
 }
 
 #[test]
@@ -106,20 +117,17 @@ fn links_in_code_blocks_and_comments_are_ignored() {
     let (sandbox, _notes, _work) = two_vaults();
     let report = lint_json(&sandbox, Some("notes"));
 
-    let all: Vec<String> = targets(&report, "unresolved")
-        .into_iter()
-        .chain(targets(&report, "foreign"))
-        .collect();
+    let unresolved = targets(&report, "unresolved");
     assert!(
-        !all.iter().any(|t| t.starts_with("Ghost")),
-        "code-block / comment links leaked into the report: {all:?}"
+        !unresolved.iter().any(|t| t.starts_with("Ghost")),
+        "code-block / comment links leaked into the report: {unresolved:?}"
     );
     // Alpha, Beta, Codename Alpha, Roadmap, Missing Note — and nothing else.
     assert_eq!(report["links_total"].as_u64(), Some(5));
 }
 
 #[test]
-fn frontmatter_alias_resolves_as_local() {
+fn a_frontmatter_alias_resolves() {
     let (sandbox, _notes, _work) = two_vaults();
     let report = lint_json(&sandbox, Some("notes"));
 
@@ -127,8 +135,8 @@ fn frontmatter_alias_resolves_as_local() {
         !targets(&report, "unresolved").contains(&"Codename Alpha".to_string()),
         "alias link reported as dangling"
     );
-    // Alpha, Beta, and the alias hit on alpha.md.
-    assert_eq!(report["resolved_local"].as_u64(), Some(3));
+    // Alpha, Beta, the alias hit on alpha.md, and Roadmap in `work`.
+    assert_eq!(report["resolved"].as_u64(), Some(4));
 }
 
 #[test]
@@ -153,8 +161,10 @@ fn orphans_exclude_daily_notes_by_default() {
     assert_eq!(report["notes_scanned"].as_u64(), Some(5));
 }
 
+/// Lint reports findings on stdout and always exits 0. It is a warning, not
+/// a gate; the caller decides what to do with it.
 #[test]
-fn lint_is_warn_only_unless_asked_to_fail() {
+fn lint_reports_findings_and_still_exits_zero() {
     let (sandbox, _notes, _work) = two_vaults();
 
     sandbox
@@ -162,40 +172,8 @@ fn lint_is_warn_only_unless_asked_to_fail() {
         .args(["lint"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("Recall Lint"))
         .stdout(predicate::str::contains("Unresolved links:"));
-
-    sandbox
-        .cmd()
-        .args(["lint", "--fail-on-unresolved"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("1 unresolved link"));
-}
-
-#[test]
-fn report_file_may_not_land_inside_a_collection() {
-    let (sandbox, notes, _work) = two_vaults();
-
-    sandbox
-        .cmd()
-        .args(["lint", "--out"])
-        .arg(notes.path().join("lint-report.md"))
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("Refusing to write"));
-    assert!(!notes.path().join("lint-report.md").exists());
-
-    let outside = tempdir().unwrap();
-    let dest = outside.path().join("lint-report.txt");
-    sandbox
-        .cmd()
-        .args(["lint", "--out"])
-        .arg(&dest)
-        .assert()
-        .success();
-    assert!(std::fs::read_to_string(&dest)
-        .unwrap()
-        .contains("Recall Lint"));
 }
 
 #[test]

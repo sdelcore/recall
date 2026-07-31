@@ -7,11 +7,13 @@ A semantic memory search CLI that indexes markdown files (primarily Obsidian vau
 - **SQLite + FTS5** - BM25 keyword search with full-text indexing
 - **Vector Embeddings** - Optional semantic search via Ollama
 - **Hybrid Search** - Combine BM25 + vector with Reciprocal Rank Fusion
-- **Recency Decay** - Optional per-collection half-life on the final score
+- **Recency Decay** - Per-collection half-life on the final score, always on
+- **LLM Reranking** - Opt-in with `--rerank`; errors out rather than degrading
 - **Vault Linting** - Dangling wikilinks and orphaned notes, warn-only
 - **File Watching** - Auto-index on file changes
+- **MCP Server** - `recall serve`, three tools over stdio
 - **Token-Efficient Output** - Compact results with citations
-- **Configurable** - Paths, exclusions, and weights via TOML config
+- **No configuration** - Collections live in the database; there is no config file
 
 ## Quick Start
 
@@ -27,7 +29,7 @@ recall collection add ~/Obsidian --name vault
 recall index
 
 # Search
-recall "what are the user's preferences"
+recall search "what are the user's preferences"
 
 # Check status
 recall status
@@ -37,31 +39,21 @@ recall status
 
 ### Search
 
-`recall "query"` is a shorthand for `recall search "query"` **with no flags**.
-It collects every remaining word into the query, so `recall "q" --limit 10`
-searches for the literal text `q --limit 10` and finds nothing. Use the
-explicit `search` subcommand whenever you pass a flag.
+Search is always hybrid (BM25 + vector), and always degrades to BM25 alone
+when nothing is embedded yet. There is no retrieval-strategy flag: the fusion
+is strictly better when vectors exist, and only the index knows whether they
+do. A query naming a year sets `--after` from it automatically.
 
 ```bash
-# Basic search (BM25)
-recall "query"
 recall search "project deadlines" --limit 10
 
-# Hybrid search (BM25 + vector). Falls back to BM25 if nothing is embedded.
-recall search "query" --hybrid
-
-# LLM reranking
+# LLM reranking. Errors out if the model is unreachable — it never
+# quietly returns unreranked results. Nothing else turns it on.
 recall search "query" --rerank
-recall search "query" --rerank --rerank-provider ollama
 
 # Output formats
-recall search "query" --format compact   # Default
-recall search "query" --format json
-recall search "query" --format full
-
-# Let the query's shape pick the parameters: a long, question-shaped query
-# turns on hybrid + rerank; a query naming a year sets --after from it.
-recall search "why did we move off sqlite for the queue" --auto
+recall search "query" --format compact   # Default; snippets truncated
+recall search "query" --format json      # Full text plus every field
 
 # Per-result diagnostics: BM25 rank, vector rank, RRF score, reranker score,
 # decay factor, and pre-decay score. Forces JSON output.
@@ -71,28 +63,37 @@ recall search "query" --trace
 recall search "query" --after 2024-01-01    # Lower date bound, inclusive
 recall search "query" --before 2024-12-31   # Upper date bound, inclusive
 recall search "query" --collection vault
-recall search "query" --project "aria"
-recall search "query" --file "*.md"
 ```
 
 Date bounds apply to `chunks.date` — whichever rung of the date cascade
 (frontmatter → filename → mtime) supplied it. They are applied to the
 candidate lists, so they behave identically in BM25 and hybrid mode.
 
+`search` is a required subcommand. The bare `recall "query"` shorthand is gone:
+it took the rest of the command line as part of the query, so `recall "q"
+--limit 10` searched for the literal string `q --limit 10`.
+
 ### Indexing
 
 Indexing writes into a collection, so register one first (see below).
 
 ```bash
-recall index                              # Every collection, at its root_path
-recall index --incremental                # Changed files only
-recall index --collection vault           # One collection
-recall index --collection vault --file path.md   # Single file
-recall index --collection vault --path ~/notes   # Override the root_path
+recall index                    # Every collection, at its root_path
+recall index --collection vault # One collection
 ```
 
-`--file` and `--path` require `--collection`; without it there is no way to
-tell which collection the rows belong to, and recall errors rather than guess.
+`index` reconciles: it re-reads every file whose mtime moved and forgets every
+indexed file that has left the disk. There is no `--incremental`, because the
+two modes differed only in that the "full" one dropped the collection's rows
+first — which made it the only one that noticed a deletion. The CLI defaulted
+to full while the MCP tool ran incremental, so a deleted note stayed
+searchable forever for whoever used the other front end.
+
+A collection always indexes its own `root_path`. Single files are the
+watcher's job (`recall watch`), which is what runs in production — but the
+watcher never prunes. It re-indexes files that change and skips events whose
+path is gone, so a deleted note leaves the index only on the next
+`recall index`.
 
 A schema or chunker change invalidates the index. There is no migration code:
 recall drops the indexed rows and the next `recall index` (plus `recall embed`)
@@ -105,20 +106,27 @@ scoped to one.
 
 ```bash
 recall collection add ~/Obsidian --name vault
-recall collection add ~/work/notes --name work --half-life-days 30
 recall collection list
 recall collection half-life work 30   # Set or replace the recency half-life
-recall collection half-life work      # Clear it; falls back to the config default
+recall collection half-life work      # Clear it; falls back to 90 days
+recall collection describe work "Client work notes"  # Context shown with hits
+recall collection describe work       # Clear the description
 recall collection remove work         # Drops its files, chunks, and embeddings
 ```
+
+`half-life` and `describe` are the only writers of their columns, so each
+validates in one place: a half-life must be positive, and a missing value
+clears rather than guesses. `add` resolves the root and fails if it does not
+exist — a typo is a typo, not a collection that silently indexes nothing.
 
 ### Embeddings
 
 ```bash
-recall embed                  # Generate embeddings
-recall embed --incremental    # Only missing
-recall embed --limit 100      # Limit for testing
+recall embed                  # Embed every chunk that has no vector yet
 ```
+
+Embedding is always incremental. A vector cannot go stale without its chunk
+being rewritten, and a rewrite drops the old row.
 
 ### File Watching
 
@@ -129,19 +137,14 @@ recall watch                  # Watch and auto-index
 ### Linting
 
 ```bash
-recall lint                        # Warn-only report on stdout (always exits 0)
+recall lint                        # Warn-only report on stdout
 recall lint --collection notes     # Report findings for one collection
 recall lint --json                 # Machine-readable report
-recall lint --out ~/lint.txt       # Write to a file outside every vault
-recall lint --fail-on-unresolved   # Exit 1 when a link resolves nowhere
 ```
 
-Every link lands in one of three states, and only the last is a finding:
-
-- `resolved-local` — target is in the same collection.
-- `resolved-foreign` — target is in another registered collection.
-  Cross-project links are valid; they are listed, not flagged.
-- `unresolved` — target found nowhere.
+A link is **resolved** when any registered collection holds the target, and
+**unresolved** when none does. Only unresolved is a finding — a cross-project
+link is deliberate, not a mistake.
 
 All collections are always scanned, so a link into another vault resolves;
 `--collection` only narrows what gets reported. Targets match note basenames
@@ -151,27 +154,35 @@ walks the markdown AST rather than the raw text.
 
 An **orphan** is a note with zero incoming *and* zero outgoing wikilinks.
 
-Lint never runs as part of indexing and never writes to the vault: `--out`
-refuses any path inside a collection root, because a report written into an
-indexed vault gets indexed.
+Lint never runs as part of indexing and never writes anything. Findings never
+change the exit code — there is no `--fail-on-unresolved`, and lint warns
+rather than gates. Only a usage error (no collections registered, or an
+unknown `--collection`) exits nonzero.
 
-### Status & Config
+The report goes to stdout; there is no `--out`, so redirect it yourself, and
+redirect it somewhere **outside** every collection root if you want to keep
+it, because a report written into an indexed vault gets indexed.
+
+### Status & Maintenance
 
 ```bash
-recall status                 # Index statistics
+recall status                 # Collections, statistics, integrity, orphan counts
 recall status --json          # JSON output
-recall config show            # Display config
-recall config path            # Show config location
 
-recall maintenance check      # PRAGMA integrity_check + orphan row counts
 recall maintenance vacuum     # Reclaim space after deletes
 recall maintenance rebuild-fts # Drop and rebuild the FTS5 index from chunks
 ```
 
+`status` answers "is the index usable?" in one place: the counts and the
+`PRAGMA integrity_check` / orphan-row checks that say whether to trust them.
+There is no `maintenance check` — it opened the same store, ran the same
+`get_stats()`, and printed the same counts. `maintenance` now holds only the
+two commands that change the database.
+
 ## Recency Ranking
 
-**Off by default.** When enabled, the final score of every dated result is
-multiplied by a half-life curve:
+**Always on.** The final score of every dated result is multiplied by a
+half-life curve:
 
 ```
 score *= 0.5 + 0.5 * exp(-ln2 * age_days / half_life_days)
@@ -181,25 +192,23 @@ The factor never drops below 0.5, so age costs a result at most half its
 score. Recency breaks ties between results the retriever already considers
 comparable; it cannot promote a weak fresh note over a strong old one.
 
-Enable it, then set a half-life per collection:
+It was a config switch defaulting to off, which meant the ranking everyone
+actually got was the worse one — the labeled query set below scores 14/16
+without decay and 16/16 with it, and the floor guarantees it cannot make a
+ranking worse. There was nothing left to hedge.
 
-```toml
-# ~/.config/recall/config.toml
-[decay]
-enabled = true
-default_half_life_days = 90.0
-```
+Set a half-life per collection:
 
 ```bash
 recall collection half-life work 30    # This corpus goes stale in a month
-recall collection half-life reference  # Clear: use default_half_life_days
+recall collection half-life reference  # Clear: fall back to 90 days
 ```
 
-**Half-life is a property of the collection, not the config file.** It lives
-in the database because one config covers several corpora that go stale at
+**Half-life is a property of the collection.** It lives
+in the database because one machine covers several corpora that go stale at
 different rates — a daily-notes vault and a reference vault should not share
-a number. `default_half_life_days` only applies to collections that have none
-of their own.
+a number. A collection with none of its own falls back to the 90-day
+`DEFAULT_HALF_LIFE_DAYS` const in `search.rs`.
 
 Two cases are left alone:
 
@@ -207,7 +216,8 @@ Two cases are left alone:
   they keep their score untouched.
 - **Temporal queries** — "notes from 2023", "when did we switch to Postgres".
   They ask for old material on purpose; demoting age would answer the
-  opposite question. Intent classification detects these.
+  opposite question. A year or a relative time word in the query detects
+  these.
 
 Dates are deliberately withheld from the reranker prompt, so this arithmetic
 is the only thing in the pipeline that acts on recency. `recall search
@@ -216,10 +226,14 @@ is the only thing in the pipeline that acts on recency. `recall search
 ## MCP Server
 
 ```bash
-recall serve --mode mcp
+recall serve
 ```
 
-JSON-RPC over stdio. Three tools:
+JSON-RPC over stdio. `serve` takes no flags: `--mode` had one legal value,
+checked against its own default, so it is gone. A caller still passing
+`--mode mcp` fails at argument parsing.
+
+Three tools:
 
 | Tool | Parameters |
 |---|---|
@@ -227,85 +241,74 @@ JSON-RPC over stdio. Three tools:
 | `recall_index` | `collection?`, `path?` |
 | `recall_status` | none |
 
-The tool surface is narrower than the CLI's on purpose. `hybrid`,
-`rerank_provider`, `project`, and `file_pattern` are server configuration, not
-something an agent can judge — the schema carries only what the question
-itself determines: text, date bounds, collection, and effort. Searches run
-with intent routing on, so the temporal-query decay skip applies over MCP
-exactly as it does with `recall search --auto`.
+The tool surface is narrower than the CLI's on purpose: `trace` is a
+diagnostic, and retrieval strategy is not something an agent can judge. The
+schema carries only what the question itself determines: text, date bounds,
+collection, and effort. MCP and CLI searches run the identical pipeline, so
+an identical query ranks identically in both.
 
 `initialize` returns instructions built from live index state: file and chunk
 counts, collection names, and capability gaps (for example "No vector
 embeddings; BM25-only").
 
-Every result is emitted on both `content[].text` and `structuredContent`, and
-`recall_search` declares an `outputSchema`. Each hit carries `path`, `line`
-(absolute, 1-indexed), `date`, `date_source`, `status`, `memory_type`,
+`recall_search` and `recall_status` emit their payload on both
+`content[].text` and `structuredContent`, because the Claude Code CLI forwards
+only the second and other clients only the first. `recall_index` and every
+error are text-only. `recall_search` declares an `outputSchema`; for it the
+text channel is the structured payload pretty-printed, where it used to be a
+second, hand-written prose rendering of the same fields. Each hit carries
+`path`, `line` (absolute, 1-indexed), `date`, `date_source`, `status`,
 `collection`, `section`, `score`, and `content`, with explicit `null` for
 unknowns.
+
+`rerank: true` that cannot reach the model returns `isError: true`. It does
+not fall back to unreranked results — a caller cannot tell the difference, and
+over MCP the warning on stderr never reaches the model.
 
 Registered in ARIA's Claude Code config at `~/.config/claude/settings.local.json`.
 
 ## Configuration
 
-Config file: `~/.config/recall/config.toml`
+There is none. Recall has no config file, and no `RECALL_CONFIG_PATH`.
 
-```toml
-[index]
-# Paths to index
-paths = ["~/Obsidian"]
-# Patterns to exclude
-exclude = ["**/Templates/**", "**/.obsidian/**", "**/attachments/**"]
+Everything that varied is either a decision the code owns or a value the
+database owns:
 
-[embeddings]
-# Ollama server for embeddings
-ollama_url = "http://localhost:11434"
-model = "nomic-embed-text"
+| Was a config key | Now |
+|---|---|
+| `[index] paths`, `[watch] paths` | `collections.root_path` — `recall collection add` |
+| `[index] exclude`, `[watch] exclude` | `EXCLUDE_GLOBS` in `store.rs`, one list for the indexer, the linter, and the watcher |
+| `[search] default_limit` | `--limit`, default 5 |
+| `[search] rrf_k` | `RRF_K` in `store.rs` — the constant from the RRF paper |
+| `[embeddings] model` | `EMBEDDING_MODEL` in `embedder.rs` — it is half the index fingerprint, so changing it rebuilds the index |
+| `[embeddings] ollama_url` | `RECALL_OLLAMA_URL`, default `http://localhost:11434` |
+| `[reranking] candidates` | `RERANK_CANDIDATES` in `search.rs` |
+| `[reranking] enabled`, `provider`, `top_k` | `--rerank`, and one adapter |
+| `[reranking.claude_code] model` | `RERANK_MODEL` in `reranker.rs` |
+| `[watch] debounce_ms` | `DEBOUNCE_MS` in `watcher.rs` |
+| `[decay] enabled`, `default_half_life_days` | always on; `recall collection half-life` |
+| `[lint] orphan_exclude` | `ORPHAN_EXCLUDE` in `lint.rs` |
 
-[search]
-# Default results count
-default_limit = 5
-# RRF constant k for hybrid search (higher = more weight to lower-ranked results)
-rrf_k = 60
+The file never existed on the machine this tool runs on, so every one of those
+keys had only ever held its compiled-in default. A knob nobody turns is not
+flexibility; it is a second place for the answer to live.
 
-[decay]
-# Weight results toward recent notes. The final score is multiplied by
-# 0.5 + 0.5 * exp(-ln2 * age_days / half_life_days), so age can cost a
-# result at most half its score and never outranks a much stronger match.
-# Undated chunks and temporal queries ("notes from 2023") are left alone.
-enabled = false
-# Half-life for collections with no half_life_days of their own.
-# Set a per-collection value with `recall collection half-life <name> <days>`.
-default_half_life_days = 90.0
+The one genuine second value is a remote Ollama box, so that one is an
+environment variable.
 
-[lint]
-# Notes matching these globs are never reported as orphans. Daily notes and
-# session logs are unlinked by design and would otherwise be the whole report.
-# Matched case-insensitively against the absolute path; links in these notes
-# still count.
-orphan_exclude = [
-  "**/daily/**",
-  "**/journal/**",
-  "**/sessions/**",
-  "**/session-*.md",
-  "**/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*.md",
-]
+## Environment
 
-[watch]
-# Paths to watch for changes
-paths = ["~/Obsidian"]
-# Patterns to exclude from watching
-exclude = ["Templates/", ".obsidian/", "attachments/", ".sync-conflict-"]
-# Debounce time before indexing
-debounce_ms = 1500
-```
+| Variable | Purpose |
+|---|---|
+| `RECALL_DB_PATH` | Database location. Default `~/.local/share/recall/memory.sqlite` |
+| `RECALL_OLLAMA_URL` | Ollama server. Default `http://localhost:11434` |
+| `RUST_LOG` | Tracing filter. Default `warn`, to stderr |
 
 ## Storage
 
 | Location | Purpose |
 |----------|---------|
 | `~/.local/share/recall/memory.sqlite` | SQLite database |
-| `~/.config/recall/config.toml` | Configuration |
 
 ## Running as Service
 
@@ -322,49 +325,35 @@ journalctl --user -u recall -f
 systemctl --user restart recall
 ```
 
-## Integration with ARIA
-
-recall provides semantic search capabilities for ARIA:
-
-- **Context Retrieval** - Find relevant notes before answering questions
-- **Memory Search** - Search MEMORY.md and past interactions
-- **Cross-Document** - Find related information across vault
-
-Example usage in prompts:
-```
-Before answering, search memory for relevant context:
-- Use recall to find patterns about user preferences
-- Search recent daily notes for in-progress work
-```
-
 ## Architecture
 
 ```
-                    ┌─────────────────┐
-                    │   CLI (clap)    │
-                    └────────┬────────┘
-                             │
-          ┌──────────────────┼──────────────────┐
-          ▼                  ▼                  ▼
-   ┌────────────┐     ┌────────────┐     ┌────────────┐
-   │   Index    │     │   Search   │     │   Watch    │
-   │  (chunker) │     │(BM25+vec)  │     │  (notify)  │
-   └─────┬──────┘     └─────┬──────┘     └─────┬──────┘
-         │                  │                  │
-         └──────────────────┼──────────────────┘
-                            ▼
-                    ┌─────────────────┐
-                    │     Store       │
-                    │ (SQLite + FTS5) │
-                    └────────┬────────┘
-                             │
-                    ┌────────┴────────┐
-                    ▼                 ▼
-             ┌──────────┐      ┌──────────┐
-             │  Config  │      │ Embedder │
-             │  (TOML)  │      │ (Ollama) │
-             └──────────┘      └──────────┘
+        ┌─────────────┐          ┌─────────────┐
+        │ CLI (clap)  │          │ MCP server  │
+        └──────┬──────┘          └──────┬──────┘
+               └───────────┬────────────┘
+                           ▼
+   ┌──────────┬────────────┬────────────┬──────────┐
+   │  search  │   index    │   watch    │   lint   │
+   │  BM25 +  │  comrak    │  notify    │  comrak  │
+   │  vector  │  chunker   │            │   AST    │
+   │  → RRF   │            │            │          │
+   │ → rerank │            │            │          │
+   │ → decay  │            │            │          │
+   └─────┬────┴─────┬──────┴─────┬──────┴──────────┘
+         │          │            │
+         ▼          ▼            ▼
+   ┌─────────────────────────┐       ┌──────────┐
+   │          store          │◄──────┤ embedder │
+   │  SQLite + FTS5 + vec0   │       │ (Ollama) │
+   └─────────────────────────┘       └──────────┘
 ```
+
+The CLI and the MCP server are two front ends over one pipeline. Both build the
+same `SearchRequest`, so an identical query ranks identically in either.
+
+`lint` is the exception: it reads the filesystem rather than the index, and
+asks the store only for the collection roots.
 
 ## Building
 
@@ -382,21 +371,23 @@ cargo build --release
 cargo test
 ```
 
-The suite is hermetic — every test drives the CLI with `RECALL_DB_PATH` and
-`RECALL_CONFIG_PATH` pointed at a temp dir, so it never reads your real
+The suite is hermetic — every test drives the CLI with `RECALL_DB_PATH`
+pointed at a temp dir, so it never reads your real
 index or vault. Nothing needs Ollama; retrieval tests are BM25-only.
 
 `tests/ranking.rs` guards ranking itself. It indexes a fixed 14-note fixture
-vault and runs 24 queries with decay off and on, comparing the ranked
-results against `tests/snapshots/ranking.json`. A change to retrieval,
-fusion, or decay shows up as a diff of that file. When the change is
-intended, regenerate the baseline and commit the diff:
+vault and runs 24 queries, comparing the ranked results against
+`tests/snapshots/ranking.json`. A change to retrieval, fusion, or decay shows
+up as a diff of that file. When the change is intended, regenerate the
+baseline and commit the diff:
 
 ```bash
 RECALL_UPDATE_SNAPSHOTS=1 cargo test --test ranking
 ```
 
 Sixteen of those queries also carry a known-correct top result. The hit rate
-is 14/16 with decay off and 16/16 with it on — the two queries decay fixes
+is 16/16 as ranked and 14/16 in pre-decay order — the two queries decay fixes
 are the ones where a superseded note is denser in the query's keywords than
-the note that replaced it.
+the note that replaced it. Because decay is unconditional there is no second
+profile to run: `--trace` reports `pre_decay_score`, so sorting the same
+result set on it reconstructs the ranking decay changed.

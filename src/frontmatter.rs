@@ -18,8 +18,6 @@
 pub struct Frontmatter {
     pub date: Option<String>,
     pub last_updated: Option<String>,
-    pub created: Option<String>,
-    pub updated: Option<String>,
     pub status: Option<String>,
     /// The `type:` key. Named `doc_type` because `type` is a Rust keyword.
     pub doc_type: Option<String>,
@@ -74,8 +72,6 @@ pub fn parse(content: &str) -> Frontmatter {
         match key.as_str() {
             "date" => fm.date = normalize_date(value),
             "last_updated" => fm.last_updated = normalize_date(value),
-            "created" => fm.created = normalize_date(value),
-            "updated" => fm.updated = normalize_date(value),
             "status" => fm.status = non_empty(unquote(value)),
             "type" => fm.doc_type = non_empty(unquote(value)),
             "aliases" => fm.aliases = parse_inline_list(value),
@@ -224,10 +220,10 @@ mod tests {
 
     #[test]
     fn rejects_non_date_shaped_values() {
-        let fm = parse("---\ndate: yesterday\ncreated: 2026-4-29\nupdated: 2026-04-29\n---\n");
+        let fm = parse("---\ndate: 2026-4-29\nlast_updated: 2026-04-29\n---\n");
         assert_eq!(fm.date, None);
-        assert_eq!(fm.created, None);
-        assert_eq!(fm.updated.as_deref(), Some("2026-04-29"));
+        assert_eq!(fm.last_updated.as_deref(), Some("2026-04-29"));
+        assert_eq!(parse("---\ndate: yesterday\n---\n").date, None);
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! Maintenance subcommand e2e: check / vacuum / rebuild-fts.
+//! Maintenance subcommand e2e: vacuum / rebuild-fts. The read-only health
+//! checks live in `recall status`; see `tests/cli.rs`.
 
 mod common;
 
@@ -19,43 +20,6 @@ fn add_and_index(sandbox: &RecallSandbox, vault: &std::path::Path, name: &str) {
         .args(["index", "--collection", name])
         .assert()
         .success();
-}
-
-#[test]
-fn maintenance_check_reports_healthy_db() {
-    let sandbox = RecallSandbox::new();
-    let vault = tempdir().unwrap();
-    write_fixture_vault(vault.path());
-    add_and_index(&sandbox, vault.path(), "test");
-
-    sandbox
-        .cmd()
-        .args(["maintenance", "check", "--json"])
-        .assert()
-        .success()
-        .stdout(predicate::function(|out: &str| {
-            let v: serde_json::Value = serde_json::from_str(out).unwrap();
-            v["integrity"] == "ok"
-                && v["orphans"]["chunks"].as_i64() == Some(0)
-                && v["orphans"]["files"].as_i64() == Some(0)
-                && v["orphans"]["embeddings"].as_i64() == Some(0)
-                && v["healthy"].as_bool() == Some(true)
-        }));
-}
-
-#[test]
-fn maintenance_default_action_is_check() {
-    let sandbox = RecallSandbox::new();
-    let vault = tempdir().unwrap();
-    write_fixture_vault(vault.path());
-    add_and_index(&sandbox, vault.path(), "test");
-
-    sandbox
-        .cmd()
-        .args(["maintenance"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Integrity:").and(predicate::str::contains("healthy")));
 }
 
 #[test]

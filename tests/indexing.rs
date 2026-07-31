@@ -1,6 +1,6 @@
 //! Indexing metadata e2e tests: the frontmatter → filename → mtime date
-//! cascade as it lands in search results, and the index fingerprint that
-//! cold-rebuilds the DB when the pipeline changes.
+//! cascade as it lands in search results, and the exclusion list that the
+//! indexer and the linter both obey.
 
 mod common;
 
@@ -19,7 +19,7 @@ fn frontmatter_metadata_reaches_search_results() {
     let vault = tempdir().unwrap();
     std::fs::write(
         vault.path().join("2020-01-01.md"),
-        "---\ndate: 2026-03-04\nstatus: active\ntype: project\n---\n\n# Note\n\nUniqueZeta token.\n",
+        "---\ndate: 2026-03-04\nstatus: active\n---\n\n# Note\n\nUniqueZeta token.\n",
     )
     .unwrap();
 
@@ -43,7 +43,6 @@ fn frontmatter_metadata_reaches_search_results() {
             r["date"] == "2026-03-04"
                 && r["date_source"] == "frontmatter"
                 && r["status"] == "active"
-                && r["memory_type"] == "semantic"
         }));
 }
 
@@ -77,11 +76,20 @@ fn undated_files_fall_back_to_mtime() {
         }));
 }
 
+/// `recall index` reconciles, it does not only add. Deleting a note used to
+/// leave its chunks searchable forever for anyone going through the MCP tool
+/// or the watcher, because only the CLI's "full" mode dropped rows first.
 #[test]
-fn changing_the_embedding_model_cold_rebuilds_the_index() {
+fn re_indexing_forgets_a_deleted_file() {
     let sandbox = RecallSandbox::new();
     let vault = tempdir().unwrap();
-    std::fs::write(vault.path().join("a.md"), "# A\n\nUniqueTheta token.\n").unwrap();
+    std::fs::write(
+        vault.path().join("keep.md"),
+        "# Keep\n\nUniqueKappa token.\n",
+    )
+    .unwrap();
+    let doomed = vault.path().join("doomed.md");
+    std::fs::write(&doomed, "# Doomed\n\nUniqueLambda token.\n").unwrap();
 
     sandbox
         .cmd()
@@ -92,14 +100,25 @@ fn changing_the_embedding_model_cold_rebuilds_the_index() {
         .success();
     sandbox.cmd().args(["index"]).assert().success();
 
-    // A different embedding model invalidates the stored vectors, so the
-    // fingerprint no longer matches and the indexed data is discarded.
-    std::fs::write(
-        sandbox.config_path(),
-        "[embeddings]\nmodel = \"some-other-model\"\n",
-    )
-    .unwrap();
+    let hits = |token: &str| -> usize {
+        let out = sandbox
+            .cmd()
+            .args(["search", token, "--format", "json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let v: serde_json::Value = serde_json::from_slice(&out).expect("json");
+        v["results"].as_array().expect("results").len()
+    };
+    assert_eq!(hits("UniqueLambda"), 1, "the doomed note must index first");
 
+    std::fs::remove_file(&doomed).unwrap();
+    sandbox.cmd().args(["index"]).assert().success();
+
+    assert_eq!(hits("UniqueLambda"), 0, "deleted note is still searchable");
+    assert_eq!(hits("UniqueKappa"), 1, "the surviving note was collateral");
     sandbox
         .cmd()
         .args(["status", "--json"])
@@ -107,23 +126,63 @@ fn changing_the_embedding_model_cold_rebuilds_the_index() {
         .success()
         .stdout(predicate::function(|out: &str| {
             let v: serde_json::Value = serde_json::from_str(out).unwrap();
-            v["chunk_count"] == 0 && v["file_count"] == 0
+            v["file_count"] == 1 && v["orphans"]["chunks"] == 0 && v["healthy"] == true
         }));
+}
 
-    // Collections survive the rebuild; re-indexing refills the chunks.
+/// A query that names a year gets that year as an `after` bound. The wildcard
+/// form is the regression: a `*` used to classify the query as "structural",
+/// which was checked first and suppressed the bound the query obviously wants.
+#[test]
+fn a_year_in_the_query_bounds_the_results() {
+    let sandbox = RecallSandbox::new();
+    let vault = tempdir().unwrap();
+    std::fs::write(
+        vault.path().join("2020-05-05.md"),
+        "# Old\n\nUniqueNu rollout notes for 2026 planning.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        vault.path().join("2026-05-05.md"),
+        "# New\n\nUniqueNu rollout notes for 2026 planning.\n",
+    )
+    .unwrap();
+
     sandbox
         .cmd()
-        .args(["collection", "list", "--json"])
+        .args(["collection", "add"])
+        .arg(vault.path())
+        .args(["--name", "notes"])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("notes"));
+        .success();
     sandbox.cmd().args(["index"]).assert().success();
-    sandbox
-        .cmd()
-        .args(["search", "UniqueTheta", "--format", "json"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("a.md"));
+
+    let paths = |query: &str| -> Vec<String> {
+        let out = sandbox
+            .cmd()
+            .args(["search", query, "--format", "json"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let v: serde_json::Value = serde_json::from_slice(&out).expect("json");
+        v["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .map(|r| r["file"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+
+    let both = paths("UniqueNu rollout");
+    assert_eq!(both.len(), 2, "{both:?}");
+
+    for query in ["UniqueNu 2026", "UniqueNu* 2026"] {
+        let bounded = paths(query);
+        assert_eq!(bounded.len(), 1, "{query:?} -> {bounded:?}");
+        assert!(bounded[0].ends_with("2026-05-05.md"), "{bounded:?}");
+    }
 }
 
 #[test]
@@ -136,10 +195,11 @@ fn collection_half_life_round_trips() {
         .cmd()
         .args(["collection", "add"])
         .arg(vault.path())
-        .args(["--name", "notes", "--half-life-days", "30"])
+        .args(["--name", "notes"])
         .assert()
         .success();
 
+    // A new collection has no half-life until one is set.
     sandbox
         .cmd()
         .args(["collection", "list", "--json"])
@@ -147,7 +207,7 @@ fn collection_half_life_round_trips() {
         .success()
         .stdout(predicate::function(|out: &str| {
             let v: serde_json::Value = serde_json::from_str(out).unwrap();
-            v[0]["half_life_days"] == 30.0
+            v[0]["half_life_days"].is_null()
         }));
 
     sandbox
@@ -193,10 +253,34 @@ fn half_life_on_unknown_collection_fails() {
         .stderr(predicate::str::contains("not found"));
 }
 
+/// `collection half-life` is the only writer of the column, so its validation
+/// is the only thing standing between a typo and a division by zero in
+/// `recency_factor`.
+#[test]
+fn a_non_positive_half_life_is_rejected() {
+    let sandbox = RecallSandbox::new();
+    let vault = tempdir().unwrap();
+    std::fs::write(vault.path().join("a.md"), "# A\n\nBody.\n").unwrap();
+
+    sandbox
+        .cmd()
+        .args(["collection", "add"])
+        .arg(vault.path())
+        .args(["--name", "notes"])
+        .assert()
+        .success();
+
+    sandbox
+        .cmd()
+        .args(["collection", "half-life", "notes", "0"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("must be positive"));
+}
+
 /// `--after` / `--before` are separate CLI flags that both land in
-/// `SearchOptions`. `run_search` takes them as adjacent positional
-/// `Option<String>` arguments, so a mis-ordered call site still compiles and
-/// would silently swap the two bounds. This pins each flag to its own edge.
+/// `SearchOptions`, adjacent to each other in `SearchRequest` and identically
+/// typed. This pins each flag to its own edge.
 #[test]
 fn search_date_bound_flags_are_wired_to_the_right_edges() {
     let sandbox = RecallSandbox::new();
@@ -260,4 +344,62 @@ fn search_date_bound_flags_are_wired_to_the_right_edges() {
         .concat(),
     );
     assert!(none.is_empty(), "{none:?}");
+}
+
+/// The indexer and the linter walk the same roots, so they must agree on what
+/// a note is. They used to read two different lists — the indexer's globs were
+/// hardcoded and the linter read `[index] exclude`, which the indexer ignored —
+/// so an excluded note was unsearchable *and* reported as an orphan.
+#[test]
+fn the_indexer_and_the_linter_share_one_exclusion_list() {
+    let sandbox = RecallSandbox::new();
+    let vault = tempdir().unwrap();
+    std::fs::create_dir_all(vault.path().join("Templates")).unwrap();
+    std::fs::write(
+        vault.path().join("Templates/daily.md"),
+        "# Template\n\nUniqueKappa placeholder.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        vault.path().join("real.md"),
+        "# Real\n\nUniqueKappa content.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        vault.path().join("note.sync-conflict-20260101-ABCDEF.md"),
+        "# Conflict\n\nUniqueKappa duplicate.\n",
+    )
+    .unwrap();
+
+    sandbox
+        .cmd()
+        .args(["collection", "add"])
+        .arg(vault.path())
+        .args(["--name", "notes"])
+        .assert()
+        .success();
+    sandbox.cmd().args(["index"]).assert().success();
+
+    // Only the real note is indexed.
+    sandbox
+        .cmd()
+        .args(["search", "UniqueKappa", "--format", "json"])
+        .assert()
+        .success()
+        .stdout(predicate::function(|out: &str| {
+            let v: serde_json::Value = serde_json::from_str(out).unwrap();
+            let files = v["results"].as_array().unwrap();
+            files.len() == 1 && files[0]["file"].as_str().unwrap().ends_with("real.md")
+        }));
+
+    // And the linter scanned exactly the same one note.
+    sandbox
+        .cmd()
+        .args(["lint", "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::function(|out: &str| {
+            let v: serde_json::Value = serde_json::from_str(out).unwrap();
+            v["notes_scanned"] == 1 && v["orphans"].as_array().unwrap().len() == 1
+        }));
 }

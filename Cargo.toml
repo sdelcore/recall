@@ -15,12 +15,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
-tiktoken-rs = "0.6"
 glob = "0.3"
 notify = "6"
 notify-debouncer-mini = "0.4"
 dirs = "5"
-toml = "0.8"
 claude-agent-sdk = "0.1"
 futures = "0.3"
 async-trait = "0.1"

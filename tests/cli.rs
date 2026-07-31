@@ -49,21 +49,36 @@ fn index_then_bm25_search_returns_expected_hit() {
         .stdout(predicate::str::contains("alpha.md"));
 }
 
+/// Status reports the counts *and* whether they can be trusted — the
+/// integrity check and orphan counts that used to be `maintenance check`.
+///
+/// `collection_roots` is the answer to "what does this index cover". It used
+/// to be `index_paths` / `watch_paths` read out of the config file, which
+/// reported `~/Obsidian` no matter where the collections actually pointed.
 #[test]
-fn status_json_reports_indexed_counts() {
+fn status_json_reports_indexed_counts_and_health() {
     let sandbox = RecallSandbox::new();
     let vault = tempdir().unwrap();
     write_fixture_vault(vault.path());
     add_and_index(&sandbox, vault.path(), "test");
+    let root = vault.path().to_string_lossy().to_string();
 
     sandbox
         .cmd()
         .args(["status", "--json"])
         .assert()
         .success()
-        .stdout(predicate::function(|out: &str| {
+        .stdout(predicate::function(move |out: &str| {
             let v: serde_json::Value = serde_json::from_str(out).unwrap();
-            v["file_count"].as_i64().unwrap() >= 3 && v["chunk_count"].as_i64().unwrap() >= 3
+            v["collection_roots"] == serde_json::json!([root])
+                && v.get("config_path").is_none()
+                && v["file_count"].as_i64().unwrap() >= 3
+                && v["chunk_count"].as_i64().unwrap() >= 3
+                && v["integrity"] == "ok"
+                && v["orphans"]["chunks"].as_i64() == Some(0)
+                && v["orphans"]["files"].as_i64() == Some(0)
+                && v["orphans"]["embeddings"].as_i64() == Some(0)
+                && v["healthy"].as_bool() == Some(true)
         }));
 }
 
@@ -77,47 +92,6 @@ fn search_with_no_index_returns_empty_results() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"results\""));
-}
-
-#[test]
-fn search_emits_intent_classification() {
-    let sandbox = RecallSandbox::new();
-    let vault = tempdir().unwrap();
-    write_fixture_vault(vault.path());
-    add_and_index(&sandbox, vault.path(), "test");
-
-    // Short specific term — lookup
-    sandbox
-        .cmd()
-        .args(["search", "Paxos", "--format", "json"])
-        .assert()
-        .success()
-        .stdout(predicate::function(|out: &str| {
-            let v: serde_json::Value = serde_json::from_str(out).unwrap();
-            v["intent"]["kind"] == "lookup"
-        }));
-
-    // Question form — exploratory
-    sandbox
-        .cmd()
-        .args(["search", "how does Paxos work?", "--format", "json"])
-        .assert()
-        .success()
-        .stdout(predicate::function(|out: &str| {
-            let v: serde_json::Value = serde_json::from_str(out).unwrap();
-            v["intent"]["kind"] == "exploratory"
-        }));
-
-    // Year reference — temporal with extracted year
-    sandbox
-        .cmd()
-        .args(["search", "Paxos in 2025", "--format", "json"])
-        .assert()
-        .success()
-        .stdout(predicate::function(|out: &str| {
-            let v: serde_json::Value = serde_json::from_str(out).unwrap();
-            v["intent"]["kind"] == "temporal" && v["intent"]["year"].as_i64() == Some(2025)
-        }));
 }
 
 #[test]

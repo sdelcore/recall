@@ -5,13 +5,11 @@
 //!
 //! Two things here are deliberate and easy to undo by accident:
 //!
-//! 1. **The tool surface is narrower than the CLI's.** `hybrid`,
-//!    `rerank_provider`, `project`, and `file_pattern` are configuration or
-//!    implementation detail, not signal an agent can reason about. Every
-//!    parameter an agent cannot decide well is a parameter it will decide
-//!    badly, so retrieval strategy stays in `config.toml` and the tool schema
-//!    carries only what the *question* determines: text, date bounds,
-//!    collection, effort.
+//! 1. **The tool surface is narrower than the CLI's.** `trace` is a
+//!    diagnostic, and retrieval strategy is not a decision an agent can make
+//!    well — every parameter an agent cannot decide well is a parameter it
+//!    will decide badly. The tool schema carries only what the *question*
+//!    determines: text, date bounds, collection, effort.
 //! 2. **Every payload goes out on both channels.** The Claude Code CLI
 //!    forwards only `structuredContent` to the model; other MCP clients
 //!    forward only `content[].text`. Emitting one and not the other silently
@@ -23,7 +21,6 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, info};
 
-use crate::config::Config;
 use crate::search;
 use crate::store::Store;
 
@@ -52,7 +49,7 @@ impl ToolOutput {
 }
 
 /// Run the MCP server on stdio (JSON-RPC over newline-delimited JSON).
-pub async fn serve_mcp(config: &Config) -> Result<()> {
+pub async fn serve_mcp() -> Result<()> {
     info!("Starting Recall MCP server (stdio)");
 
     let stdin = tokio::io::stdin();
@@ -87,7 +84,7 @@ pub async fn serve_mcp(config: &Config) -> Result<()> {
         let response = match method {
             "initialize" => handle_initialize(&id),
             "tools/list" => handle_tools_list(&id),
-            "tools/call" => handle_tools_call(&id, &request, config).await,
+            "tools/call" => handle_tools_call(&id, &request).await,
             "notifications/initialized" | "notifications/cancelled" => {
                 // Notifications don't get responses
                 continue;
@@ -251,7 +248,7 @@ Each result is one chunk of one file:
 - `path` — absolute file path.
 - `line` — absolute, 1-indexed line where the chunk starts. To read around a hit: Read(path, offset=line-20, limit=80).
 - `date` + `date_source` — when the chunk is from, and how that was determined ("frontmatter" = author-declared, "filename" = dated note, "mtime" = filesystem timestamp only). `null` when unknown; a date is never invented.
-- `status`, `memory_type`, `collection`, `section` — metadata, reported and never used to exclude results.
+- `status`, `collection`, `section` — metadata, reported and never used to exclude results.
 - `score` — relevance after fusion, optional reranking, and recency decay. Comparable within one result set, not across searches.
 
 Results are dated digests, not live state; when two results conflict, the newer date wins; volatile facts — versions, ports, hostnames, current status — must be verified live.
@@ -284,8 +281,8 @@ Scope to one collection and spend an LLM call on precision:
 
 ## Notes
 
-- `rerank` re-scores candidates with an LLM. It costs seconds; use it when precision matters more than latency, not by default.
-- Retrieval strategy (hybrid vs keyword-only, providers, candidate counts) is server configuration and is intentionally not exposed here.
+- `rerank` re-scores candidates with an LLM. It costs seconds; use it when precision matters more than latency, not by default. Nothing else turns it on.
+- Retrieval fuses keyword and vector candidates automatically. There is no strategy knob and nothing to tune per call.
 - Zero results usually means wrong vocabulary, not absent knowledge. Retry once with different terms before concluding the note does not exist."#;
 
 fn search_output_schema() -> Value {
@@ -308,14 +305,13 @@ fn search_output_schema() -> Value {
                             "description": "How `date` was determined"
                         },
                         "status": {"type": ["string", "null"]},
-                        "memory_type": {"type": ["string", "null"]},
                         "collection": {"type": ["string", "null"]},
                         "section": {"type": ["string", "null"]},
                         "score": {"type": "number"},
                         "content": {"type": "string"}
                     },
                     "required": ["path", "line", "date", "date_source", "status",
-                                 "memory_type", "collection", "score", "content"]
+                                 "collection", "score", "content"]
                 }
             }
         },
@@ -369,7 +365,7 @@ fn handle_tools_list(id: &Option<Value>) -> Value {
                 },
                 {
                     "name": "recall_index",
-                    "description": "Trigger incremental re-indexing. With no args, indexes every collection at its root_path. Only needed when files changed and the watcher is not running.",
+                    "description": "Reconcile the index with the filesystem: re-read changed files and forget deleted ones. With no args, does this for every collection at its root_path. Only needed when files changed and the watcher is not running.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -398,13 +394,13 @@ fn handle_tools_list(id: &Option<Value>) -> Value {
     })
 }
 
-async fn handle_tools_call(id: &Option<Value>, request: &Value, config: &Config) -> Value {
+async fn handle_tools_call(id: &Option<Value>, request: &Value) -> Value {
     let tool_name = request["params"]["name"].as_str().unwrap_or("");
     let arguments = &request["params"]["arguments"];
 
     let result = match tool_name {
-        "recall_search" => tool_search(arguments, config).await,
-        "recall_index" => tool_index(arguments, config).await,
+        "recall_search" => tool_search(arguments).await,
+        "recall_index" => tool_index(arguments).await,
         "recall_status" => tool_status().await,
         _ => Err(anyhow::anyhow!("Unknown tool: {}", tool_name)),
     };
@@ -433,7 +429,7 @@ async fn handle_tools_call(id: &Option<Value>, request: &Value, config: &Config)
     }
 }
 
-async fn tool_search(args: &Value, config: &Config) -> Result<ToolOutput> {
+async fn tool_search(args: &Value) -> Result<ToolOutput> {
     let query = args["query"]
         .as_str()
         .context("recall_search requires a 'query' string parameter")?;
@@ -443,27 +439,14 @@ async fn tool_search(args: &Value, config: &Config) -> Result<ToolOutput> {
     let before = args["before"].as_str().map(|s| s.to_string());
     let collection = args["collection"].as_str().map(|s| s.to_string());
 
-    let outcome = search::search(
-        config,
-        search::SearchRequest {
-            query: query.to_string(),
-            limit,
-            collection,
-            after,
-            before,
-            project: None,
-            file_pattern: None,
-            // Retrieval strategy is config, not a tool parameter — the tool
-            // schema deliberately has no `hybrid` knob to override this.
-            hybrid: true,
-            rerank,
-            rerank_provider_override: None,
-            // Intent routing (and with it the temporal-query decay guard) is
-            // pipeline behavior, not a CLI feature. Leaving this false is what
-            // made MCP searches rank differently from identical CLI searches.
-            auto: true,
-        },
-    )
+    let outcome = search::search(search::SearchRequest {
+        query: query.to_string(),
+        limit,
+        collection,
+        after,
+        before,
+        rerank,
+    })
     .await?;
 
     let results: Vec<Value> = outcome
@@ -476,7 +459,6 @@ async fn tool_search(args: &Value, config: &Config) -> Result<ToolOutput> {
                 "date": r.date,
                 "date_source": r.date_source,
                 "status": r.status,
-                "memory_type": r.memory_type,
                 "collection": r.collection_name,
                 "section": r.section,
                 "score": r.score,
@@ -485,69 +467,36 @@ async fn tool_search(args: &Value, config: &Config) -> Result<ToolOutput> {
         })
         .collect();
 
+    let result_count = results.len();
     let structured = json!({
         "query": outcome.query,
-        "result_count": results.len(),
+        "result_count": result_count,
         "results": results,
     });
 
+    // The text channel is the same payload, pretty-printed. It used to be a
+    // hand-written prose renderer of the very same ten fields, which also
+    // restated the retrieval contract and the `Read(path, offset=line-20)`
+    // hint — both of which already reach the model through the server
+    // instructions and this tool's description. Three copies of two sentences,
+    // and a second formatter to keep in sync with the first.
+    let text = if result_count == 0 {
+        format!(
+            "No results for \"{}\".\nTry different vocabulary — the words that would appear in \
+             the note itself — before concluding it does not exist.",
+            outcome.query
+        )
+    } else {
+        serde_json::to_string_pretty(&structured)?
+    };
+
     Ok(ToolOutput {
-        text: render_search_text(&outcome),
+        text,
         structured: Some(structured),
     })
 }
 
-/// Render the same result set as plain text for clients that forward only
-/// `content[].text`. Every field in `structuredContent` appears here too;
-/// this is a different rendering, not a smaller one.
-fn render_search_text(outcome: &search::SearchOutcome) -> String {
-    if outcome.results.is_empty() {
-        return format!(
-            "No results for \"{}\".\nTry different vocabulary — the words that would appear in \
-             the note itself — before concluding it does not exist.",
-            outcome.query
-        );
-    }
-
-    let mut out = format!(
-        "Found {} result(s) for \"{}\".\n{}\n",
-        outcome.results.len(),
-        outcome.query,
-        RETRIEVAL_CONTRACT
-    );
-
-    for (i, (r, _)) in outcome.results.iter().enumerate() {
-        let date = match (r.date.as_deref(), r.date_source.as_deref()) {
-            (Some(d), Some(src)) => format!("{d} (from {src})"),
-            (Some(d), None) => d.to_string(),
-            (None, _) => "undated".to_string(),
-        };
-        out.push_str(&format!(
-            "\n[{}] {}:{}\n    score={:.4}  date={}  collection={}  memory_type={}  status={}\n",
-            i + 1,
-            r.file_path,
-            r.start_line,
-            r.score,
-            date,
-            r.collection_name.as_deref().unwrap_or("null"),
-            r.memory_type.as_deref().unwrap_or("null"),
-            r.status.as_deref().unwrap_or("null"),
-        ));
-        if let Some(section) = &r.section {
-            out.push_str(&format!("    section={section}\n"));
-        }
-        for line in r.content.lines() {
-            out.push_str("    ");
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-
-    out.push_str("\nRead(path, offset=line-20, limit=80) for context around any hit.\n");
-    out
-}
-
-async fn tool_index(args: &Value, _config: &Config) -> Result<ToolOutput> {
+async fn tool_index(args: &Value) -> Result<ToolOutput> {
     let store = Store::open()?;
     let collection = args["collection"].as_str();
     let path_arg = args["path"].as_str();
@@ -572,13 +521,13 @@ async fn tool_index(args: &Value, _config: &Config) -> Result<ToolOutput> {
     let mut count = 0usize;
     for target in &targets {
         let dir = match path_arg {
-            Some(p) => crate::config::expand_home(p),
+            Some(p) => crate::expand_home(p),
             None => target.root_path.clone(),
         };
         if dir.is_empty() {
             continue;
         }
-        store.index_incremental(target.id, &dir)?;
+        store.index(target.id, &dir)?;
         count += 1;
     }
 

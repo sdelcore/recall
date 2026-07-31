@@ -8,8 +8,8 @@
 use comrak::nodes::{AstNode, NodeValue};
 use comrak::{parse_document, Arena, ComrakOptions};
 
-/// A chunk produced by the AST chunker. Date / project / memory_type are
-/// file-level concerns added by the caller.
+/// A chunk produced by the AST chunker. The date and `status` are file-level
+/// concerns added by the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawChunk {
     pub content: String,

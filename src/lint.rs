@@ -4,8 +4,10 @@
 //! from one vault to another is deliberate, not a mistake. Off-the-shelf vault
 //! linters assume a single vault, so they report every cross-project link as
 //! broken. This module therefore resolves a link against *all* registered
-//! collections and reports three states — `resolved-local`, `resolved-foreign`,
-//! and `unresolved`. Only `unresolved` is a finding.
+//! collections: a link is resolved when *some* collection holds the target,
+//! and only an unresolved link is a finding. Which collection answered used to
+//! be a third state with its own report section, listing links that are
+//! correct.
 //!
 //! Two other things it does differently from the usual regex-over-raw-text
 //! linter:
@@ -27,23 +29,25 @@ use glob::MatchOptions;
 use serde::Serialize;
 use std::collections::HashMap;
 
-use crate::config::Config;
 use crate::frontmatter;
 use crate::store::Collection;
 
-/// How a wikilink resolved against the set of registered collections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum LinkState {
-    /// Target found in the same collection as the note that links to it.
-    ResolvedLocal,
-    /// Target found in a different collection. Valid, reported for visibility.
-    ResolvedForeign,
-    /// Target found nowhere. The only finding.
-    Unresolved,
-}
+/// Notes that are never orphans, however few links they have.
+///
+/// Daily notes and session logs are unlinked by design, and in a real vault
+/// they outnumber everything else — left in, they bury the orphan report under
+/// noise and nobody reads it again. They are still scanned for the links they
+/// contain; they are only kept out of the orphan list.
+const ORPHAN_EXCLUDE: &[&str] = &[
+    "**/daily/**",
+    "**/journal/**",
+    "**/sessions/**",
+    "**/session-*.md",
+    // A `YYYY-MM-DD` stem is a daily note wherever it lives.
+    "**/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*.md",
+];
 
-/// One wikilink occurrence.
+/// One unresolved wikilink occurrence.
 #[derive(Debug, Clone, Serialize)]
 pub struct Link {
     pub collection: String,
@@ -51,9 +55,6 @@ pub struct Link {
     pub line: u32,
     /// The link target after stripping `|alias` and `#heading`.
     pub target: String,
-    pub state: LinkState,
-    /// Collection holding the target, when `state` is `resolved-foreign`.
-    pub resolved_in: Option<String>,
 }
 
 /// The result of a lint run. Counts cover every scanned note; the vectors hold
@@ -62,11 +63,10 @@ pub struct Link {
 pub struct LintReport {
     pub notes_scanned: usize,
     pub links_total: usize,
-    pub resolved_local: usize,
-    pub foreign: Vec<Link>,
+    pub resolved: usize,
     pub unresolved: Vec<Link>,
-    /// Notes with zero incoming and zero outgoing wikilinks, minus the
-    /// configured `[lint] orphan_exclude` globs.
+    /// Notes with zero incoming and zero outgoing wikilinks, minus
+    /// [`ORPHAN_EXCLUDE`].
     pub orphans: Vec<String>,
 }
 
@@ -84,13 +84,13 @@ struct Note {
 /// `None`). Notes outside `only` are still scanned, because a link is only
 /// unresolved when *no* collection holds the target and an orphan is only an
 /// orphan when *no* collection links to it.
-pub fn lint(config: &Config, collections: &[Collection], only: Option<&str>) -> Result<LintReport> {
+pub fn lint(collections: &[Collection], only: Option<&str>) -> Result<LintReport> {
     let mut notes = Vec::new();
     for collection in collections {
         if collection.root_path.is_empty() {
             continue;
         }
-        scan_collection(config, collection, &mut notes)?;
+        scan_collection(collection, &mut notes)?;
     }
 
     // name -> the notes answering to it. A name is rarely ambiguous, but two
@@ -113,15 +113,14 @@ pub fn lint(config: &Config, collections: &[Collection], only: Option<&str>) -> 
                 .get(target.to_lowercase().as_str())
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            let local = candidates
+            // Prefer a target in the linking note's own collection so that
+            // `incoming` credits the note a reader would actually open; any
+            // collection resolves the link.
+            let hit = candidates
                 .iter()
                 .copied()
-                .find(|&i| notes[i].collection == note.collection);
-            let (state, hit) = match (local, candidates.first().copied()) {
-                (Some(i), _) => (LinkState::ResolvedLocal, Some(i)),
-                (None, Some(i)) => (LinkState::ResolvedForeign, Some(i)),
-                (None, None) => (LinkState::Unresolved, None),
-            };
+                .find(|&i| notes[i].collection == note.collection)
+                .or_else(|| candidates.first().copied());
             resolutions.push((
                 hit,
                 Link {
@@ -129,11 +128,6 @@ pub fn lint(config: &Config, collections: &[Collection], only: Option<&str>) -> 
                     file: note.path.clone(),
                     line: *line,
                     target: target.clone(),
-                    state,
-                    resolved_in: match state {
-                        LinkState::ResolvedForeign => hit.map(|i| notes[i].collection.clone()),
-                        _ => None,
-                    },
                 },
             ));
         }
@@ -147,14 +141,13 @@ pub fn lint(config: &Config, collections: &[Collection], only: Option<&str>) -> 
             continue;
         }
         report.links_total += 1;
-        match link.state {
-            LinkState::ResolvedLocal => report.resolved_local += 1,
-            LinkState::ResolvedForeign => report.foreign.push(link),
-            LinkState::Unresolved => report.unresolved.push(link),
+        match hit {
+            Some(_) => report.resolved += 1,
+            None => report.unresolved.push(link),
         }
     }
 
-    let orphan_exclude = compile_globs(&config.lint.orphan_exclude);
+    let orphan_exclude = orphan_exclude_globs();
     for note in &notes {
         if !selected(&note.collection, only) {
             continue;
@@ -177,15 +170,15 @@ fn selected(collection: &str, only: Option<&str>) -> bool {
     }
 }
 
-/// Walk one collection's root for markdown files, honoring `[index] exclude`
-/// so the linter sees exactly the notes the indexer sees.
-fn scan_collection(config: &Config, collection: &Collection, out: &mut Vec<Note>) -> Result<()> {
-    let exclude = compile_globs(&config.index.exclude);
+/// Walk one collection's root for markdown files, honoring the same
+/// [`crate::store::EXCLUDE_GLOBS`] the indexer obeys so the linter sees exactly
+/// the notes the indexer sees.
+fn scan_collection(collection: &Collection, out: &mut Vec<Note>) -> Result<()> {
     let pattern = format!("{}/**/*.md", collection.root_path);
     for entry in glob::glob(&pattern)? {
         let path = entry?;
         let path_str = path.to_string_lossy().to_string();
-        if matches_any(&exclude, &path_str) || path_str.contains(".sync-conflict-") {
+        if crate::store::is_excluded(&path_str) {
             continue;
         }
         // A note we cannot read is a warning, never a failed run.
@@ -215,10 +208,17 @@ fn scan_collection(config: &Config, collection: &Collection, out: &mut Vec<Note>
     Ok(())
 }
 
-fn compile_globs(patterns: &[String]) -> Vec<glob::Pattern> {
-    patterns
+/// Compile [`ORPHAN_EXCLUDE`], panicking on a malformed pattern.
+///
+/// A panic is right because the patterns are compile-time constants: a bad one
+/// is a bug in this file, and `orphan_exclude_compiles` catches it in CI before
+/// anyone runs the binary. Skipping a pattern that failed to parse — the
+/// previous behaviour — buries the orphan report under every daily note in the
+/// vault and gives the reader no clue why.
+fn orphan_exclude_globs() -> Vec<glob::Pattern> {
+    ORPHAN_EXCLUDE
         .iter()
-        .filter_map(|p| glob::Pattern::new(p).ok())
+        .map(|p| glob::Pattern::new(p).expect("ORPHAN_EXCLUDE are compile-time constants"))
         .collect()
 }
 
@@ -246,7 +246,32 @@ fn extract_wikilinks(content: &str) -> Vec<(String, u32)> {
     let mut text = String::new();
     let mut lines: Vec<u32> = Vec::new();
     collect_text(root, &mut text, &mut lines);
+
+    let offset = frontmatter_lines(root);
     scan(&text, &lines)
+        .into_iter()
+        .map(|(target, line)| (target, line + offset))
+        .collect()
+}
+
+/// How many source lines comrak swallowed into the frontmatter block.
+///
+/// comrak restarts `sourcepos` at line 1 *after* frontmatter and stamps the
+/// frontmatter node itself with line 0, so without this correction every line
+/// this module reports is short by the size of that block. Every note that
+/// feeds the date cascade carries frontmatter, so that is nearly every note in
+/// a real vault — and being short by four is worse than being obviously wrong,
+/// because it sends the reader to a line that exists and looks innocent.
+///
+/// The node keeps its raw text, including any blank line comrak absorbed after
+/// the closing delimiter, so counting its lines is the whole correction.
+fn frontmatter_lines<'a>(root: &'a AstNode<'a>) -> u32 {
+    root.children()
+        .find_map(|node| match &node.data.borrow().value {
+            NodeValue::FrontMatter(raw) => Some(raw.lines().count() as u32),
+            _ => None,
+        })
+        .unwrap_or(0)
 }
 
 fn collect_text<'a>(node: &'a AstNode<'a>, text: &mut String, lines: &mut Vec<u32>) {
@@ -350,6 +375,18 @@ mod tests {
         extract_wikilinks(md).into_iter().map(|(t, _)| t).collect()
     }
 
+    /// Every [`ORPHAN_EXCLUDE`] entry must parse. A malformed one used to be
+    /// dropped silently, which turns the exclusion into a no-op and floods the
+    /// orphan list with daily notes.
+    #[test]
+    fn orphan_exclude_compiles() {
+        let globs = orphan_exclude_globs();
+        assert_eq!(globs.len(), ORPHAN_EXCLUDE.len());
+        assert!(matches_any(&globs, "/v/notes/2026-07-31-standup.md"));
+        assert!(matches_any(&globs, "/v/Daily/anything.md"));
+        assert!(!matches_any(&globs, "/v/notes/architecture.md"));
+    }
+
     #[test]
     fn extracts_plain_alias_and_heading_forms() {
         let md = "See [[Alpha]], [[Beta|the beta note]] and [[Gamma#Section]].\n";
@@ -389,6 +426,21 @@ mod tests {
     fn reports_the_source_line() {
         let md = "# Title\n\nFirst line.\n\nA link to [[Alpha]] here.\n";
         assert_eq!(extract_wikilinks(md), [("Alpha".to_string(), 5)]);
+    }
+
+    /// comrak numbers the body of a note with frontmatter from 1, not from the
+    /// top of the file. Reported lines have to be file lines — the point of the
+    /// number is that you can open the file at it.
+    #[test]
+    fn frontmatter_does_not_shift_the_reported_line() {
+        // The link sits on file line 7.
+        let md = "---\ndate: 2026-06-01\nstatus: current\n---\n# Title\n\nA link to [[Alpha]].\n";
+        assert_eq!(extract_wikilinks(md), [("Alpha".to_string(), 7)]);
+
+        // A blank line after the closing delimiter belongs to the block too,
+        // so the link is on file line 8 and must be reported as 8.
+        let md = "---\ndate: 2026-06-01\nstatus: current\n---\n\n# Title\n\nA link to [[Alpha]].\n";
+        assert_eq!(extract_wikilinks(md), [("Alpha".to_string(), 8)]);
     }
 
     #[test]

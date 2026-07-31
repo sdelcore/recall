@@ -3,19 +3,24 @@
 //!
 //! Ranking moved three ways in this branch — date filters that were silently
 //! dropped in hybrid mode now run, recency decay multiplies the final score,
-//! and the MCP server routes intent. None of that is attributable without a
-//! baseline, so this file supplies one:
+//! and a query naming a year gets a date bound. None of that is attributable
+//! without a baseline, so this file supplies one:
 //!
 //! 1. **Differential snapshot.** Every query's ranked chunk list is compared
-//!    against `tests/snapshots/ranking.json`, once with decay off and once
-//!    with it on. A ranking change becomes a readable diff instead of a
-//!    surprise. Regenerate deliberately with `RECALL_UPDATE_SNAPSHOTS=1`.
+//!    against `tests/snapshots/ranking.json`. A ranking change becomes a
+//!    readable diff instead of a surprise. Regenerate deliberately with
+//!    `RECALL_UPDATE_SNAPSHOTS=1`.
 //! 2. **Labeled queries.** Sixteen queries with a known-correct top result,
-//!    scored as a hit rate under both profiles. Two of them are supersession
-//!    pairs — an old, keyword-dense decision record against the short note
-//!    that overturned it — and they are the entire reason decay exists. If
-//!    the hit rate does not improve when decay is switched on, decay is not
-//!    working.
+//!    scored as a hit rate. Two of them are supersession pairs — an old,
+//!    keyword-dense decision record against the short note that overturned it
+//!    — and they are the entire reason decay exists.
+//!
+//! Decay is unconditional, so there is no "decay off" profile to run. The
+//! comparison it used to provide comes from `--trace` instead: `pre_decay_score`
+//! is the score the pipeline would have returned without decay, so sorting on
+//! it reconstructs the pre-decay ranking from the same single search. That is
+//! a stronger baseline than the old config toggle — it is measured from the
+//! shipped code path rather than from a second one.
 //!
 //! Hermetic and BM25-only: temp dirs throughout (via `RecallSandbox`), no
 //! embeddings, no Ollama, no LLM. Every fixture date is written relative to
@@ -33,10 +38,6 @@ use tempfile::{tempdir, TempDir};
 /// Results captured per query. Deep enough to show a reorder below the
 /// winner, shallow enough to keep the snapshot readable.
 const LIMIT: &str = "5";
-
-/// Long enough that the year-old reference notes are not yet pinned to the
-/// 0.5 floor, short enough that a superseded decision record is.
-const DECAY_CONFIG: &str = "[decay]\nenabled = true\ndefault_half_life_days = 90.0\n";
 
 /// Queries whose correct top result is known. The answer is what a person
 /// asking that question wants *today*, which is why `primary datastore`
@@ -68,9 +69,9 @@ const DECAY_SENSITIVE: &[&str] = &["primary datastore", "deploy target"];
 
 /// The snapshot set: every labeled query plus eight broader ones that return
 /// several competing chunks, so a reorder below rank 1 still shows up.
-/// Queries stay under five tokens and carry no `?`, year, glob, or `.md`, to
-/// keep the intent classifier on `Lookup` and the reranker (which would need
-/// a network) switched off.
+/// Queries stay under five tokens and carry no year or relative time word, so
+/// no query picks up an implicit `after` bound or skips decay. Reranking needs
+/// a network and is never routed, so it stays off.
 ///
 /// `runs` is the widest age spread in the corpus — an eight-year-old note, a
 /// five-year-old one, and a one-year-old one — so it is the most sensitive
@@ -110,10 +111,6 @@ fn days_ago(n: i64) -> String {
 }
 
 /// An indexed fixture vault plus the sandbox that owns its database.
-///
-/// The vault is indexed once; `set_decay` only rewrites `config.toml`, which
-/// every subsequent `recall` process re-reads. `[decay]` is not part of the
-/// index fingerprint, so flipping it never triggers a rebuild.
 struct Harness {
     sandbox: RecallSandbox,
     /// Kept alive so the vault outlives the harness; the indexed paths live
@@ -131,7 +128,6 @@ impl Harness {
         let sandbox = RecallSandbox::new();
         let vault = tempdir().expect("vault tempdir");
         write_ranking_vault(vault.path());
-        std::fs::write(sandbox.config_path(), "").expect("config");
 
         sandbox
             .cmd()
@@ -155,19 +151,20 @@ impl Harness {
         }
     }
 
-    fn set_decay(&self, enabled: bool) {
-        let body = if enabled { DECAY_CONFIG } else { "" };
-        std::fs::write(self.sandbox.config_path(), body).expect("config");
-    }
-
-    /// Ranked chunk identities for one query: `relative/path.md:start_line`.
-    /// The line number matters — a note splits into several chunks, and a
-    /// change in *which* chunk of a note wins is a ranking change too.
-    fn ranked(&self, query: &str) -> Vec<String> {
+    /// One search, two orderings.
+    ///
+    /// `.0` is the ranking as returned — decay applied. `.1` is the same
+    /// chunks re-sorted by `pre_decay_score`, which is what the pipeline would
+    /// have returned had decay not run. Both come from a single `--trace`
+    /// search, so the baseline is measured from the shipped code path.
+    ///
+    /// `pre_decay_score` is null for a chunk decay skipped (no usable date);
+    /// its score is already the pre-decay one, so it stands in unchanged.
+    fn rankings(&self, query: &str) -> (Vec<String>, Vec<String>) {
         let output = self
             .sandbox
             .cmd()
-            .args(["search", query, "--format", "json", "--limit", LIMIT])
+            .args(["search", query, "--trace", "--limit", LIMIT])
             .assert()
             .success()
             .get_output()
@@ -175,7 +172,11 @@ impl Harness {
             .clone();
         let json: serde_json::Value =
             serde_json::from_slice(&output).expect("search must emit JSON");
-        json["results"]
+
+        // `relative/path.md:start_line` — the line number matters, because a
+        // note splits into several chunks and a change in *which* chunk of a
+        // note wins is a ranking change too.
+        let mut scored: Vec<(String, f64)> = json["results"]
             .as_array()
             .expect("results array")
             .iter()
@@ -186,26 +187,37 @@ impl Harness {
                     .unwrap_or_else(|| panic!("{file} is not under {}", self.root));
                 let line = r["lines"].as_str().expect("lines");
                 let start = line.split('-').next().unwrap_or(line);
-                format!("{relative}:{start}")
+                let pre = r["trace"]["pre_decay_score"]
+                    .as_f64()
+                    .unwrap_or_else(|| r["score"].as_f64().expect("score"));
+                (format!("{relative}:{start}"), pre)
             })
-            .collect()
+            .collect();
+
+        let ranked: Vec<String> = scored.iter().map(|(id, _)| id.clone()).collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).expect("comparable scores"));
+        let pre_decay: Vec<String> = scored.into_iter().map(|(id, _)| id).collect();
+        (ranked, pre_decay)
+    }
+
+    fn ranked(&self, query: &str) -> Vec<String> {
+        self.rankings(query).0
     }
 
     /// Relative path of the top result, ignoring which chunk of it won.
-    fn top(&self, query: &str) -> Option<String> {
-        self.ranked(query)
+    fn top_of(ranked: &[String]) -> Option<String> {
+        ranked
             .first()
             .and_then(|entry| entry.rsplit_once(':').map(|(path, _)| path.to_string()))
     }
 
     /// Best rank any chunk of `path` reached, panicking if the note is
     /// missing — an absent note would otherwise read as a very good rank.
-    fn rank_of(&self, query: &str, path: &str) -> usize {
-        let ranked = self.ranked(query);
+    fn rank_of(ranked: &[String], path: &str) -> usize {
         ranked
             .iter()
             .position(|entry| entry.starts_with(&format!("{path}:")))
-            .unwrap_or_else(|| panic!("{query:?} returned no chunk of {path}: {ranked:?}"))
+            .unwrap_or_else(|| panic!("no chunk of {path} in {ranked:?}"))
     }
 
     fn capture(&self) -> Ranking {
@@ -214,19 +226,22 @@ impl Harness {
             .collect()
     }
 
-    /// Fraction of labeled queries whose top result is the expected note,
-    /// plus the queries that missed.
-    fn hit_rate(&self) -> (usize, Vec<&'static str>) {
-        let mut hits = 0;
+    /// Labeled queries whose top result is not the expected note, scored
+    /// twice from the same searches: as ranked, and as the pre-decay order
+    /// would have ranked them.
+    fn missed(&self) -> (Vec<&'static str>, Vec<&'static str>) {
         let mut missed = Vec::new();
+        let mut missed_pre_decay = Vec::new();
         for (query, expected) in LABELED {
-            if self.top(query).as_deref() == Some(*expected) {
-                hits += 1;
-            } else {
+            let (ranked, pre_decay) = self.rankings(query);
+            if Self::top_of(&ranked).as_deref() != Some(*expected) {
                 missed.push(*query);
             }
+            if Self::top_of(&pre_decay).as_deref() != Some(*expected) {
+                missed_pre_decay.push(*query);
+            }
         }
-        (hits, missed)
+        (missed, missed_pre_decay)
     }
 }
 
@@ -391,13 +406,13 @@ fn write_ranking_vault(root: &Path) {
     }
 }
 
-fn diff(profile: &str, expected: &Ranking, actual: &Ranking) -> Vec<String> {
+fn diff(expected: &Ranking, actual: &Ranking) -> Vec<String> {
     let mut lines = Vec::new();
     for query in expected.keys().chain(actual.keys()).collect::<Vec<_>>() {
         let (want, got) = (expected.get(query), actual.get(query));
         if want != got {
             lines.push(format!(
-                "[{profile}] {query:?}\n  snapshot: {:?}\n  actual:   {:?}",
+                "{query:?}\n  snapshot: {:?}\n  actual:   {:?}",
                 want.map(Vec::as_slice).unwrap_or(&[]),
                 got.map(Vec::as_slice).unwrap_or(&[])
             ));
@@ -411,16 +426,8 @@ fn diff(profile: &str, expected: &Ranking, actual: &Ranking) -> Vec<String> {
 #[test]
 fn ranked_output_matches_the_snapshot() {
     let harness = Harness::new();
-
-    harness.set_decay(false);
-    let baseline = harness.capture();
-    harness.set_decay(true);
-    let decayed = harness.capture();
-
+    let actual = harness.capture();
     let path = snapshot_path();
-    let actual: BTreeMap<&str, &Ranking> = [("baseline", &baseline), ("decay", &decayed)]
-        .into_iter()
-        .collect();
 
     if std::env::var_os("RECALL_UPDATE_SNAPSHOTS").is_some() {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
@@ -436,18 +443,9 @@ fn ranked_output_matches_the_snapshot() {
             path.display()
         )
     });
-    let expected: BTreeMap<String, Ranking> = serde_json::from_str(&raw).expect("parse snapshot");
+    let expected: Ranking = serde_json::from_str(&raw).expect("parse snapshot");
 
-    let mut lines = diff(
-        "baseline",
-        expected.get("baseline").expect("baseline profile"),
-        &baseline,
-    );
-    lines.extend(diff(
-        "decay",
-        expected.get("decay").expect("decay profile"),
-        &decayed,
-    ));
+    let lines = diff(&expected, &actual);
     assert!(
         lines.is_empty(),
         "ranking changed against {}:\n{}\n\nIf the change is intended, regenerate with \
@@ -457,34 +455,30 @@ fn ranked_output_matches_the_snapshot() {
     );
 }
 
+/// The headline measurement: decay answers every labeled query, and the
+/// pre-decay order — the ranking recall would return without it — misses
+/// exactly the two supersession pairs. A different miss list means the fixture
+/// drifted and the comparison no longer measures decay.
 #[test]
-fn decay_improves_the_labeled_hit_rate() {
+fn decay_answers_every_labeled_query_and_the_pre_decay_order_does_not() {
     let harness = Harness::new();
-
-    harness.set_decay(false);
-    let (baseline_hits, baseline_missed) = harness.hit_rate();
-    harness.set_decay(true);
-    let (decayed_hits, decayed_missed) = harness.hit_rate();
+    let (missed, missed_pre_decay) = harness.missed();
 
     assert!(
-        decayed_missed.is_empty(),
-        "decay must answer every labeled query; missed {decayed_missed:?}"
+        missed.is_empty(),
+        "decay must answer every labeled query; missed {missed:?}"
     );
-    assert_eq!(decayed_hits, LABELED.len());
-
-    // The baseline must miss exactly the supersession pairs. A different
-    // miss list means the fixture drifted and the comparison is no longer
-    // measuring decay.
     assert_eq!(
-        baseline_missed.as_slice(),
+        missed_pre_decay.as_slice(),
         DECAY_SENSITIVE,
-        "baseline missed {baseline_missed:?}, expected exactly {DECAY_SENSITIVE:?}"
+        "pre-decay order missed {missed_pre_decay:?}, expected exactly {DECAY_SENSITIVE:?}"
     );
-    assert_eq!(baseline_hits, LABELED.len() - DECAY_SENSITIVE.len());
 }
 
+/// The two supersession pairs, chunk by chunk: relevance alone puts the stale
+/// note first, and decay is what lifts current truth to rank 1.
 #[test]
-fn a_superseded_note_outranks_current_truth_until_decay_is_enabled() {
+fn decay_lifts_current_truth_over_a_superseded_note() {
     let harness = Harness::new();
     let pairs = [
         (
@@ -500,16 +494,15 @@ fn a_superseded_note_outranks_current_truth_until_decay_is_enabled() {
     ];
 
     for (query, stale, current) in pairs {
-        harness.set_decay(false);
+        let (ranked, pre_decay) = harness.rankings(query);
+
         assert!(
-            harness.rank_of(query, stale) < harness.rank_of(query, current),
+            Harness::rank_of(&pre_decay, stale) < Harness::rank_of(&pre_decay, current),
             "{query:?}: the stale note must win on relevance alone, otherwise this \
              fixture proves nothing about decay"
         );
-
-        harness.set_decay(true);
         assert_eq!(
-            harness.rank_of(query, current),
+            Harness::rank_of(&ranked, current),
             0,
             "{query:?}: decay must lift {current} over {stale}"
         );
