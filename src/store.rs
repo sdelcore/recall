@@ -176,7 +176,7 @@ impl Store {
     /// Open or create a store at an explicit path. `open` derives the path
     /// from the environment; tests need to vary it per-case without racing
     /// on a process-wide env var.
-    fn open_at(db_path: PathBuf) -> Result<Self> {
+    pub(crate) fn open_at(db_path: PathBuf) -> Result<Self> {
         register_sqlite_vec();
 
         // Ensure parent directory exists
@@ -517,15 +517,27 @@ impl Store {
         Ok(())
     }
 
-    /// Get all chunk IDs that don't have embeddings
-    pub fn get_chunks_without_embeddings(&self) -> Result<Vec<(i64, String)>> {
+    /// Chunks that have no vector yet, lowest id first.
+    ///
+    /// `limit` bounds one call, for a caller that embeds the backlog a piece
+    /// at a time. The order is part of the contract: without it a bounded call
+    /// could be handed the same rows every time and never finish the backlog.
+    /// SQLite reads a negative `LIMIT` as "no limit", so one statement covers
+    /// both callers.
+    pub fn get_chunks_without_embeddings(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<(i64, String)>> {
         let mut stmt = self.conn.prepare(
             r#"SELECT c.id, c.content
                FROM chunks c
-               WHERE c.id NOT IN (SELECT rowid FROM vec_embeddings)"#,
+               WHERE c.id NOT IN (SELECT rowid FROM vec_embeddings)
+               ORDER BY c.id
+               LIMIT ?1"#,
         )?;
 
-        let results = stmt.query_map([], |row| {
+        let bound = limit.map_or(-1, |n| n as i64);
+        let results = stmt.query_map([bound], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })?;
 
@@ -1168,7 +1180,7 @@ mod tests {
         store.index(collection.id, &root).unwrap();
 
         let embedding = vec![0.1f32; crate::embedder::EMBEDDING_DIM];
-        for (chunk_id, _) in store.get_chunks_without_embeddings().unwrap() {
+        for (chunk_id, _) in store.get_chunks_without_embeddings(None).unwrap() {
             store.store_embedding(chunk_id, &embedding).unwrap();
         }
         (dir, store, embedding)

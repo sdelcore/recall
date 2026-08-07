@@ -560,21 +560,17 @@ fn run_watch() -> Result<()> {
     watcher::watch_directories()
 }
 
-/// How many chunks go through the model in one forward pass. The batch is
-/// where the throughput is; 32 keeps the padded activations small enough to
-/// stay comfortable on a laptop.
-const EMBED_BATCH: usize = 32;
-
 fn run_embed() -> Result<()> {
     let store = store::Store::open()?;
 
-    // Chunks that need embeddings. Embedding is always incremental: a chunk's
-    // vector cannot go stale without the chunk itself being rewritten, and a
-    // rewrite drops the old row.
-    let chunks = store.get_chunks_without_embeddings()?;
-    let total = chunks.len();
+    // Embedding is always incremental: a chunk's vector cannot go stale
+    // without the chunk itself being rewritten, and a rewrite drops the old
+    // row. Counted before the model loads, so an index that needs nothing
+    // costs nothing.
+    let (embedded, total_chunks) = store.get_embedding_stats()?;
+    let pending = total_chunks - embedded;
 
-    if total == 0 {
+    if pending == 0 {
         println!("All chunks already have embeddings.");
         return Ok(());
     }
@@ -584,56 +580,33 @@ fn run_embed() -> Result<()> {
     let embedder = embedder::Embedder::load()?;
     println!(
         "Generating embeddings for {} chunks using {} from {}...\n",
-        total,
+        pending,
         embedder::EMBEDDING_MODEL,
         embedder.source()
     );
 
-    let mut success_count = 0;
-    let mut error_count = 0;
-
-    for (done, batch) in chunks.chunks(EMBED_BATCH).enumerate() {
-        let first = done * EMBED_BATCH + 1;
-        print!("\r[{}/{}] Embedding...", first + batch.len() - 1, total);
-        std::io::Write::flush(&mut std::io::stdout())?;
-
-        let texts: Vec<&str> = batch.iter().map(|(_, content)| content.as_str()).collect();
-        let embeddings = match embedder.embed_batch(&texts) {
-            Ok(embeddings) => embeddings,
-            Err(e) => {
-                eprintln!(
-                    "\nFailed to embed chunks {}..{}: {}",
-                    first,
-                    first + batch.len() - 1,
-                    e
-                );
-                error_count += batch.len();
-                continue;
-            }
-        };
-
-        for ((chunk_id, _), embedding) in batch.iter().zip(embeddings) {
-            if let Err(e) = store.store_embedding(*chunk_id, &embedding) {
-                eprintln!("\nFailed to store embedding for chunk {}: {}", chunk_id, e);
-                error_count += 1;
-            } else {
-                success_count += 1;
-            }
-        }
-    }
+    let progress = embedder::embed_pending(
+        &store,
+        &|texts| embedder.embed_batch(texts),
+        None,
+        |done, total| {
+            print!("\r[{done}/{total}] Embedding...");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        },
+    )?;
 
     println!("\n\nEmbedding complete:");
-    println!("  Success: {}", success_count);
-    if error_count > 0 {
-        println!("  Errors: {}", error_count);
+    println!("  Success: {}", progress.embedded);
+    if progress.failed > 0 {
+        println!("  Errors: {}", progress.failed);
     }
 
-    let (embedded, total_chunks) = store.get_embedding_stats()?;
+    let (embedded_now, total_now) = store.get_embedding_stats()?;
     println!(
         "  Total embedded: {}/{} chunks ({:.1}%)",
-        embedded,
-        total_chunks,
-        (embedded as f64 / total_chunks as f64) * 100.0
+        embedded_now,
+        total_now,
+        (embedded_now as f64 / total_now as f64) * 100.0
     );
 
     Ok(())
