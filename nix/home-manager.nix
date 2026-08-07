@@ -149,11 +149,15 @@ in
         default = true;
         description = ''
           Run `recall watch` as a systemd user service, auto-indexing each
-          collection root on change.
+          collection root on change and embedding the new chunks a few
+          minutes later.
 
           The service indexes once at start (`recall watch` itself only reacts
           to changes, so without this a fresh machine would keep an empty
-          index until someone ran `recall index` by hand).
+          index until someone ran `recall index` by hand). It needs no
+          companion `recall embed` timer: the watcher sweeps for chunks
+          without vectors on its own, including the backlog that first index
+          leaves behind.
         '';
       };
     };
@@ -198,7 +202,10 @@ in
         Type = "simple";
         # `recall watch` only reacts to changes. Index once first so a fresh
         # machine converges without a manual step; subsequent runs skip
-        # unchanged files by mtime and cost almost nothing.
+        # unchanged files by mtime and cost almost nothing. Embedding is not
+        # run here — `recall watch` drains the backlog itself, in slices, so
+        # a cold vault's twenty minutes of forward passes do not sit in front
+        # of the watcher starting.
         ExecStartPre = "${cfg.package}/bin/recall index";
         ExecStart = "${cfg.package}/bin/recall watch";
         Restart = "on-failure";

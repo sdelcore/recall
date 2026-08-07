@@ -39,7 +39,7 @@ recall/
 │   ├── reranker.rs   # LLM reranking (claude-agent-sdk)
 │   ├── lint.rs       # Vault link linter (dangling wikilinks, orphaned notes)
 │   ├── mcp.rs        # MCP stdio server (recall_search, recall_index, recall_status)
-│   └── watcher.rs    # File system watcher (notify-rs)
+│   └── watcher.rs    # File system watcher (notify-rs) + embedding sweep
 ├── tests/
 │   ├── common/       # RecallSandbox: hermetic RECALL_DB_PATH
 │   ├── ranking.rs    # Retrieval regression harness (snapshot + labeled queries)
@@ -63,11 +63,11 @@ recall/
 - **Chunker** (`chunker.rs`): wraps `ast.rs` with the file-level metadata stamped onto every chunk from a file — the date cascade and frontmatter `status`. Its heuristics are private and unit-tested in isolation.
 - **Intent** (`intent.rs`): two string-inspection functions, no LLM call, so latency stays predictable. `year()` pulls a 2000-2099 year out of the query, which becomes an `after` bound; `is_temporal()` says whether the query asks about a point in time, which skips recency decay. It used to classify into four buckets, two of which routed nothing and one of which — `structural` — was checked first and actively harmful: `*.md from 2025` matched it and lost both the year bound and the decay skip. Reranking is never routed; it costs seconds, so only `--rerank` turns it on.
 - **Frontmatter** (`frontmatter.rs`): hand-rolled scanner for the leading `---` block. Reads flat scalars only (`date`, `last_updated`, `status`, `type`, `aliases`). No `serde_yaml` — it is unmaintained.
-- **Embedder** (`embedder.rs`): in-process embeddings on the CPU via candle (`candle-transformers` BERT + `tokenizers`). No service, no network at runtime, no native math library, no ONNX runtime — hybrid search works anywhere the binary runs, which is the whole reason for the choice. `EMBEDDING_MODEL` (`BAAI/bge-small-en-v1.5`) and `EMBEDDING_DIM` (384) are consts because both are in the index fingerprint. `load()` costs ~0.6s and then runs ~9 chunks/sec, so callers load once and batch — `recall embed` loads once for the whole run and feeds it `EMBED_BATCH` (32) chunks per forward pass. Vectors are L2-normalized, so a dot product is a cosine. `RECALL_MODEL_PATH` pins a directory of weights and never touches the network; otherwise the weights come from the hf-hub cache. A `config.json` whose `hidden_size` is not 384 is rejected at load time, so the wrong model fails with a sentence rather than a tensor shape error.
+- **Embedder** (`embedder.rs`): in-process embeddings on the CPU via candle (`candle-transformers` BERT + `tokenizers`). No service, no network at runtime, no native math library, no ONNX runtime — hybrid search works anywhere the binary runs, which is the whole reason for the choice. `EMBEDDING_MODEL` (`BAAI/bge-small-en-v1.5`) and `EMBEDDING_DIM` (384) are consts because both are in the index fingerprint. `load()` costs ~0.6s and then runs ~9 chunks/sec, so callers load once and batch. `embed_pending()` is that loop, and it is the one both callers use: it takes the chunks with no vector, lowest id first, and feeds them through the model `EMBED_BATCH` (32) at a time. `recall embed` passes no budget and drains the index; the watcher passes a small one and comes back. A batch the model rejects is counted and skipped rather than fatal — the chunks keep no vector, so the next run retries them, and one bad batch does not discard the fifteen minutes of work behind it. Vectors are L2-normalized, so a dot product is a cosine. `RECALL_MODEL_PATH` pins a directory of weights and never touches the network; otherwise the weights come from the hf-hub cache. A `config.json` whose `hidden_size` is not 384 is rejected at load time, so the wrong model fails with a sentence rather than a tensor shape error.
 - **Reranker** (`reranker.rs`): LLM-based reranking through the `claude-agent-sdk` crate. No API key needed; all candidates go into one prompt. Reranking failures propagate as errors — degrading to RRF order is invisible to the caller, and over MCP the warning never reaches the model.
 - **MCP** (`mcp.rs`): Model Context Protocol server over stdio. Exposes 3 tools: `recall_search`, `recall_index`, `recall_status`, plus dynamic server instructions on `initialize`. Registered in ARIA's Claude Code MCP config.
 - **Lint** (`lint.rs`): `recall lint` — reads the vault from disk (never the index) and reports dangling wikilinks and orphaned notes. A link resolves against *every* registered collection, so a cross-project link is not a finding. See "Linting" below.
-- **Watcher** (`watcher.rs`): notify-rs over every collection's `root_path`, debounced by `DEBOUNCE_MS`. It re-indexes a changed `.md` file into the collection that owns it. It does **not** notice deletions — an event whose path no longer exists is skipped, so only `recall index` (or the `recall_index` tool) prunes a removed note. That is the one job the watcher does not cover.
+- **Watcher** (`watcher.rs`): notify-rs over every collection's `root_path`, debounced by `DEBOUNCE_MS`. It re-indexes a changed `.md` file into the collection that owns it, and between events it embeds — see "Watcher embedding sweep" below. It does **not** notice deletions — an event whose path no longer exists is skipped, so only `recall index` (or the `recall_index` tool) prunes a removed note. That is the one job the watcher does not cover.
 
 ## Database
 
@@ -186,6 +186,46 @@ queries, which ask for old material on purpose. Dates are kept **out** of the
 rerank prompt so the arithmetic is the only recency authority. `--trace`
 reports `decay_factor` and `pre_decay_score`.
 
+## Watcher Embedding Sweep
+
+`recall watch` embeds as well as indexes. It used to only index, which left
+every note written since the last `recall embed` reachable by keyword alone —
+invisible to the vector half of the search that the whole index exists to
+serve, with nothing in the output to say so. On a real vault that gap stayed
+open until somebody noticed and ran `recall embed` by hand.
+
+The two halves are not done together, because they do not cost the same.
+Indexing a note is milliseconds; embedding its chunks is a ~0.6s model load
+plus ~110ms per chunk. Embedding inline would put the model on the critical
+path of every save, and a sync that rewrites a hundred notes would queue
+minutes of forward passes in front of the next one — so a note saved during a
+bulk write would not be findable *at all* until that queue drained. Keyword
+search decides whether a note is findable at all, so it stays first.
+
+Instead the event loop waits with a deadline (`EMBED_INTERVAL`, 300s) and
+sweeps when it expires. A sweep embeds at most `EMBED_BUDGET` (128) chunks —
+about 15s, the longest a file change can wait behind the embedder — and a
+sweep that spends its whole budget schedules the next one immediately. So the
+budget bounds latency, not throughput: a large backlog still drains at full
+speed, in slices, with queued events serviced between them. "Spent its whole
+budget" is not enough on its own — a sweep also has to have embedded
+something, or a model failing on every batch would turn the sweep into a busy
+loop.
+
+Three properties worth keeping:
+
+- **It embeds whatever the index is missing, not only what this process
+  indexed.** The invariant is "the vectors keep up with the chunks", which also
+  heals the backlog an earlier `recall index` left behind.
+- **The model is held only while there is work.** The pending count is read
+  first (a cheap `COUNT`), so an idle vault never loads the weights, and the
+  sweeper drops them once the backlog is empty rather than resident for a
+  process that runs for weeks.
+- **A model that will not load disables embedding and logs why; it does not
+  stop the watcher.** Exiting would cost keyword search too, and under systemd
+  it would be a restart loop. This is the one place recall degrades instead of
+  failing, and it is loud: `recall status` reports the coverage gap.
+
 ## Ranking Regression Harness
 
 `tests/ranking.rs` is the baseline for every future ranking change. It
@@ -233,8 +273,11 @@ re-measured if it changed, or a column the database owns:
 | `EMBEDDING_DIM` | `embedder.rs` | 384 — the `vec0` width, also in the fingerprint |
 | `RERANK_CANDIDATES` | `search.rs` | 20 — what fits in one rerank prompt |
 | `DEFAULT_HALF_LIFE_DAYS` | `search.rs` | 90 |
+| `EMBED_BATCH` | `embedder.rs` | 32 chunks per forward pass |
 | `RERANK_MODEL` | `reranker.rs` | `haiku` |
 | `DEBOUNCE_MS` | `watcher.rs` | 1500 |
+| `EMBED_INTERVAL` | `watcher.rs` | 300s between embedding sweeps |
+| `EMBED_BUDGET` | `watcher.rs` | 128 chunks per sweep — ~15s of work |
 | `ORPHAN_EXCLUDE` | `lint.rs` | daily notes, journals, session logs |
 
 Two environment variables change behaviour: `RECALL_DB_PATH` (also what makes

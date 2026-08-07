@@ -20,6 +20,8 @@ use candle_transformers::models::bert::{BertModel, Config};
 use std::path::{Path, PathBuf};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
+use crate::store::Store;
+
 /// The embedding model, and therefore half of the index fingerprint. Changing
 /// it makes every stored vector incomparable and cold-rebuilds the whole
 /// index, so it is a code change with a consequence, not a setting.
@@ -260,6 +262,96 @@ impl ModelFiles {
 const HUB_HINT: &str = "Set RECALL_MODEL_PATH to a directory holding config.json, tokenizer.json \
                         and model.safetensors to load the model offline.";
 
+/// How many chunks go through the model in one forward pass. The batch is
+/// where the throughput is; 32 keeps the padded activations small enough to
+/// stay comfortable on a laptop.
+const EMBED_BATCH: usize = 32;
+
+/// What one [`embed_pending`] call did.
+pub struct EmbedProgress {
+    /// Chunks the call took on. Equal to the budget when the budget ran out
+    /// before the backlog did — which is how a bounded caller knows there is
+    /// more work waiting.
+    pub attempted: usize,
+    /// Chunks whose vector is now stored.
+    pub embedded: usize,
+    /// Chunks the model or the database refused. They keep no vector, so the
+    /// next call picks them up again.
+    pub failed: usize,
+}
+
+/// The model's batch entry point, as a plain function. [`embed_pending`] takes
+/// it this way so the backlog loop can be exercised without weights.
+pub type BatchEmbed<'a> = dyn Fn(&[&str]) -> Result<Vec<Vec<f32>>> + 'a;
+
+/// Embed the chunks the indexer left without a vector, lowest id first.
+///
+/// One loop, two callers: `recall embed` passes no budget and drains the
+/// index, the watcher passes a small one so a large backlog cannot hold its
+/// event loop for minutes. `on_batch` receives `(done, total)` before each
+/// forward pass, for a progress line.
+///
+/// `embed` is the model's batch entry point; see [`BatchEmbed`]. CI never
+/// downloads weights, so the loop is tested through a stand-in.
+///
+/// A batch the model rejects is counted and skipped rather than fatal: the
+/// chunks keep no vector, so the next run retries them, and one bad batch does
+/// not throw away the fifteen minutes of work behind it.
+pub fn embed_pending(
+    store: &Store,
+    embed: &BatchEmbed<'_>,
+    budget: Option<usize>,
+    mut on_batch: impl FnMut(usize, usize),
+) -> Result<EmbedProgress> {
+    let chunks = store.get_chunks_without_embeddings(budget)?;
+    let total = chunks.len();
+    let mut progress = EmbedProgress {
+        attempted: total,
+        embedded: 0,
+        failed: 0,
+    };
+
+    for (index, batch) in chunks.chunks(EMBED_BATCH).enumerate() {
+        let first = index * EMBED_BATCH + 1;
+        let last = first + batch.len() - 1;
+        on_batch(last, total);
+
+        let texts: Vec<&str> = batch.iter().map(|(_, content)| content.as_str()).collect();
+        let embeddings = match embed(&texts) {
+            Ok(embeddings) => embeddings,
+            Err(e) => {
+                eprintln!("\nFailed to embed chunks {first}..{last}: {e}");
+                progress.failed += batch.len();
+                continue;
+            }
+        };
+        // A short batch would zip away the tail chunks: not embedded, not
+        // counted, and back in the next call's backlog — which reads as
+        // progress to a caller that is looping on it.
+        if embeddings.len() != texts.len() {
+            eprintln!(
+                "\nEmbedding chunks {first}..{last} returned {} vectors for {} chunks",
+                embeddings.len(),
+                texts.len()
+            );
+            progress.failed += batch.len();
+            continue;
+        }
+
+        for ((chunk_id, _), embedding) in batch.iter().zip(embeddings) {
+            match store.store_embedding(*chunk_id, &embedding) {
+                Ok(()) => progress.embedded += 1,
+                Err(e) => {
+                    eprintln!("\nFailed to store embedding for chunk {chunk_id}: {e}");
+                    progress.failed += 1;
+                }
+            }
+        }
+    }
+
+    Ok(progress)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +376,141 @@ mod tests {
         for name in files {
             std::fs::write(dir.join(name), "{}").unwrap();
         }
+    }
+
+    /// A store holding `sections` chunks and no vectors. One heading per
+    /// chunk, so the count is exact rather than a function of the size cap.
+    fn store_with_chunks(dir: &Path, sections: usize) -> Store {
+        let vault = dir.join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let note: String = (0..sections)
+            .map(|i| format!("# Section {i}\n\nquokka zebra {i}\n\n"))
+            .collect();
+        std::fs::write(vault.join("note.md"), note).unwrap();
+
+        let store = Store::open_at(dir.join("memory.sqlite")).unwrap();
+        let root = vault.to_string_lossy().to_string();
+        let collection = store.create_collection("t", &root).unwrap();
+        store.index(collection.id, &root).unwrap();
+        assert_eq!(
+            store.get_embedding_stats().unwrap(),
+            (0, sections as i64),
+            "fixture should be one chunk per section, none embedded"
+        );
+        store
+    }
+
+    /// Stands in for the model. The vectors are constant — these tests are
+    /// about the backlog loop, not about what it stores.
+    fn fake_embed(texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|_| vec![0.1f32; EMBEDDING_DIM]).collect())
+    }
+
+    /// The watcher embeds in slices so a large backlog cannot hold its event
+    /// loop. That only works if each slice takes the *next* chunks.
+    #[test]
+    fn a_budget_bounds_one_call_and_the_next_call_resumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_chunks(tmp.path(), 40);
+
+        let first = embed_pending(&store, &fake_embed, Some(10), |_, _| {}).unwrap();
+        assert_eq!((first.attempted, first.embedded, first.failed), (10, 10, 0));
+
+        let second = embed_pending(&store, &fake_embed, Some(10), |_, _| {}).unwrap();
+        assert_eq!(
+            (second.attempted, second.embedded, second.failed),
+            (10, 10, 0)
+        );
+
+        assert_eq!(store.get_embedding_stats().unwrap(), (20, 40));
+    }
+
+    /// `attempted` is how a bounded caller learns there is more to do. It has
+    /// to fall short of the budget exactly when the backlog is exhausted.
+    #[test]
+    fn attempted_falls_short_of_the_budget_only_on_the_last_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_chunks(tmp.path(), 15);
+
+        assert_eq!(
+            embed_pending(&store, &fake_embed, Some(10), |_, _| {})
+                .unwrap()
+                .attempted,
+            10
+        );
+        assert_eq!(
+            embed_pending(&store, &fake_embed, Some(10), |_, _| {})
+                .unwrap()
+                .attempted,
+            5
+        );
+    }
+
+    /// One rejected batch must not throw away the work behind it, and the
+    /// chunks it skipped must stay pending for the next run.
+    #[test]
+    fn a_rejected_batch_is_counted_and_the_run_continues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_chunks(tmp.path(), 40);
+
+        let calls = std::cell::Cell::new(0);
+        let flaky = |texts: &[&str]| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                bail!("out of memory")
+            }
+            fake_embed(texts)
+        };
+
+        let progress = embed_pending(&store, &flaky, None, |_, _| {}).unwrap();
+        assert_eq!(calls.get(), 2, "both batches attempted");
+        assert_eq!(
+            (progress.attempted, progress.embedded, progress.failed),
+            (40, 8, EMBED_BATCH)
+        );
+
+        // The failed batch kept no vector, so a retry picks it up.
+        assert_eq!(
+            embed_pending(&store, &fake_embed, None, |_, _| {})
+                .unwrap()
+                .embedded,
+            EMBED_BATCH
+        );
+    }
+
+    /// A short batch used to zip away: the tail chunks kept no vector but were
+    /// counted as attempted, which a bounded caller reads as progress.
+    #[test]
+    fn a_short_batch_counts_as_failed_rather_than_silently_dropping_chunks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_chunks(tmp.path(), 4);
+
+        let short = |texts: &[&str]| Ok(fake_embed(texts)?.into_iter().skip(1).collect());
+        let progress = embed_pending(&store, &short, None, |_, _| {}).unwrap();
+
+        assert_eq!(
+            (progress.attempted, progress.embedded, progress.failed),
+            (4, 0, 4)
+        );
+        assert_eq!(store.get_embedding_stats().unwrap(), (0, 4));
+    }
+
+    /// The watcher sweeps on a timer forever. A sweep with nothing to do must
+    /// not reach the model at all.
+    #[test]
+    fn nothing_pending_never_touches_the_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_chunks(tmp.path(), 4);
+        embed_pending(&store, &fake_embed, None, |_, _| {}).unwrap();
+
+        let progress = embed_pending(
+            &store,
+            &|_| panic!("the model must not be called with an empty backlog"),
+            None,
+            |_, _| panic!("no batch to report"),
+        )
+        .unwrap();
+        assert_eq!(progress.attempted, 0);
     }
 
     #[test]

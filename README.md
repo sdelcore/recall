@@ -154,8 +154,29 @@ full `recall index` plus a full `recall embed`.
 ### File Watching
 
 ```bash
-recall watch                  # Watch and auto-index
+recall watch                  # Watch, auto-index, and embed
 ```
+
+The watcher indexes a changed note within `DEBOUNCE_MS` and embeds it on the
+next sweep — every 300s, up to 128 chunks per sweep, more sweeps back to back
+while a backlog remains. So a note is keyword-searchable in seconds and
+vector-searchable within a few minutes, and neither `recall embed` nor a timer
+has to be run by hand.
+
+The two are separated on purpose. Indexing a note costs milliseconds and
+embedding its chunks costs a model load plus ~110ms each, so embedding inline
+would put a sync that rewrote a hundred notes in front of the next save.
+Keyword search is what decides whether a note is findable at all; it goes
+first, and the vectors catch up.
+
+A sweep reads the pending count before anything else, so an idle vault never
+loads the model, and the weights are dropped once the backlog is empty. If the
+model cannot load at all, the watcher says so once and keeps indexing —
+losing vector search is bad, losing both is worse. `recall status` reports the
+coverage gap.
+
+The watcher still never prunes: a deleted note leaves the index on the next
+`recall index`.
 
 ### Linting
 
